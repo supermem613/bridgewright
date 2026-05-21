@@ -1,0 +1,99 @@
+{
+  "name": "bridgewright",
+  "displayName": "Bridgewright",
+  "description": "Use your local browser from Playwright running in Codespaces.",
+  "version": "0.1.0",
+  "publisher": "marcusm",
+  "author": "Marcus Markiewicz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/supermem613/bridgewright.git"
+  },
+  "icon": "images/bridgewright-icon.png",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Testing",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:bridgewright.start",
+    "onCommand:bridgewright.stop",
+    "onCommand:bridgewright.status",
+    "onCommand:bridgewright.endpoint",
+    "onCommand:bridgewright.showLogs"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "bridgewright.start",
+        "title": "Bridgewright: Start Local Browser Bridge"
+      },
+      {
+        "command": "bridgewright.stop",
+        "title": "Bridgewright: Stop Local Browser Bridge"
+      },
+      {
+        "command": "bridgewright.status",
+        "title": "Bridgewright: Show Status"
+      },
+      {
+        "command": "bridgewright.endpoint",
+        "title": "Bridgewright: Copy CDP Endpoint"
+      },
+      {
+        "command": "bridgewright.showLogs",
+        "title": "Bridgewright: Show Logs"
+      }
+    ],
+    "configuration": {
+      "title": "Bridgewright",
+      "properties": {
+        "bridgewright.defaultRemotePort": {
+          "type": "number",
+          "default": 37373,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Preferred Codespace localhost port for the CDP endpoint."
+        },
+        "bridgewright.tunnelPortOffset": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Offset from the CDP endpoint port for Bridgewright's internal tunnel port."
+        },
+        "bridgewright.edgeUserDataDir": {
+          "type": "string",
+          "default": "",
+          "description": "Windows Edge user data directory to use for Bridgewright. Leave empty to use the permanent Edge profile root at %LOCALAPPDATA%\\Microsoft\\Edge\\User Data."
+        },
+        "bridgewright.connectorPoolSize": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Number of idle local tunnel connectors Bridgewright keeps ready for incoming Codespace CDP connections."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "npm run test",
+    "lint": "tsc -p . --noEmit",
+    "test": "npm run build && node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "@types/vscode": "^1.92.0",
+    "typescript": "^5.8.3"
+  }
+}

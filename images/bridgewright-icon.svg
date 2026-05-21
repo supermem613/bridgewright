@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Bridgewright brush bridge">
+  <rect width="1024" height="1024" fill="#fff"/>
+  <g fill="none" stroke="#073B68" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M160 769c121-43 275-58 451-47 83 5 159 18 236 44" stroke-width="19" opacity=".96"/>
+    <path d="M154 781c136-36 302-51 488-37 74 6 138 17 207 37" stroke-width="7" opacity=".58"/>
+    <path d="M169 756c141-34 298-47 470-35 70 5 134 14 196 30" stroke-width="5" opacity=".42"/>
+    <path d="M183 783c137-27 291-38 462-27 64 4 123 12 183 25" stroke-width="4" opacity=".36"/>
+
+    <path d="M422 190c20 85 46 178 78 278 26 82 46 163 60 245" stroke-width="23" opacity=".98"/>
+    <path d="M434 194c36 97 67 198 93 303 20 81 31 153 34 226" stroke-width="9" opacity=".68"/>
+    <path d="M414 204c13 82 31 162 55 241 35 113 64 217 86 312" stroke-width="6" opacity=".44"/>
+    <path d="M441 238c16 87 38 178 66 273 23 78 39 153 49 224" stroke-width="4" opacity=".3"/>
+
+    <path d="M424 195c-41 177-116 320-226 429" stroke-width="8" opacity=".92"/>
+    <path d="M433 301c-36 125-107 233-211 322" stroke-width="3.5" opacity=".38"/>
+    <path d="M427 342c-44 108-105 194-183 258" stroke-width="2.5" opacity=".25"/>
+
+    <path d="M436 205c49 92 111 176 186 252 81 82 160 145 237 189" stroke-width="4" opacity=".86"/>
+    <path d="M451 253c67 101 136 184 207 250 74 69 145 119 211 151" stroke-width="2.5" opacity=".42"/>
+    <path d="M463 291c68 88 137 159 207 213 67 53 132 92 195 117" stroke-width="2.2" opacity=".33"/>
+    <path d="M476 330c66 76 133 136 202 181 61 41 121 70 179 88" stroke-width="2" opacity=".3"/>
+    <path d="M489 371c62 63 127 113 194 150 56 31 110 54 163 68" stroke-width="1.8" opacity=".28"/>
+    <path d="M503 413c56 51 113 92 172 121 50 25 98 43 144 55" stroke-width="1.6" opacity=".25"/>
+    <path d="M516 456c48 41 96 72 146 95 40 18 80 31 119 40" stroke-width="1.4" opacity=".22"/>
+    <path d="M529 501c38 29 76 52 116 68 31 13 62 22 93 28" stroke-width="1.2" opacity=".2"/>
+  </g>
+</svg>
