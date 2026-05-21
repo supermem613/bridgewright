@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.vsix
+.audit-repo.yaml
 
 .bridgewright-runtime/
 .DS_Store
