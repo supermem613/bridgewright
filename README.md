@@ -2,8 +2,6 @@
 
 Use your local browser from Playwright running in Codespaces.
 
-![Bridgewright logo](images/bridgewright-logo.png)
-
 Bridgewright is a VS Code extension that exposes your Windows Microsoft Edge profile to code running inside your Codespace as a plain Chrome DevTools Protocol endpoint:
 
 ```ts
