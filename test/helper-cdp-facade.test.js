@@ -45,9 +45,11 @@ async function startHelper(options = {}) {
   const { cdpPort, tunnelPort } = ports;
   const root = options.root || fs.mkdtempSync(path.join(os.tmpdir(), 'bridgewright-helper-test-'));
   const helperPath = path.join(root, 'bridgewright-helper.js');
+  const checkerPath = path.join(root, 'bridgewright-check-endpoint.js');
   const readyPath = path.join(root, 'ready.json');
   const logPath = path.join(root, 'helper.log');
   fs.writeFileSync(helperPath, extractHelperScript(), 'utf8');
+  fs.writeFileSync(checkerPath, 'console.log("bridgewright checker");\n', 'utf8');
 
   const args = [
     helperPath,
@@ -64,6 +66,8 @@ async function startHelper(options = {}) {
     readyPath,
     '--runtime-log',
     logPath,
+    '--connector-timeout-ms',
+    String(options.connectorTimeoutMs ?? options.discoveryTimeoutMs ?? 400),
     '--discovery-timeout-ms',
     String(options.discoveryTimeoutMs ?? 400),
   );
@@ -258,6 +262,9 @@ test('helper writes ready state', async () => {
     assert.equal(ready.status, 'running');
     assert.equal(ready.cdpPort, helper.cdpPort);
     assert.equal(ready.tunnelPort, helper.tunnelPort);
+    const endpoint = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.bridgewright', 'endpoint.json'), 'utf8'));
+    assert.equal(endpoint.status, 'starting');
+    assert.equal(endpoint.cdpReady, false);
   });
 
 
@@ -309,6 +316,55 @@ test('/json and /json/list proxy discovery endpoints', async () => {
       assert.equal(response.statusCode, 200);
       assert.equal(JSON.parse(response.body)[0].id, 'page-1');
     }
+  });
+});
+
+test('discovery endpoints normalize trailing slashes for Playwright compatibility', async () => {
+  await withHelper(async helper => {
+    for (const [requestPath, upstreamPath] of [
+      ['/json/version/', '/json/version'],
+      ['/json/version///', '/json/version'],
+      ['/json/list/', '/json/list'],
+      ['/json/list///', '/json/list'],
+      ['/json/', '/json'],
+      ['/json/protocol/', '/json/protocol'],
+    ]) {
+      const tunnel = await connectTunnel(helper.tunnelPort);
+      const pending = httpGet(helper.cdpPort, requestPath);
+      const request = (await tunnel.nextFrame()).toString('utf8');
+      assert.match(request, new RegExp(`^GET ${upstreamPath.replace('/', '\\/')} HTTP\\/1\\.1`, 'm'));
+      const body = upstreamPath === '/json/version'
+        ? JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${helper.cdpPort}/devtools/browser/test` })
+        : JSON.stringify([]);
+      tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      tunnel.close();
+      const response = await pending;
+      assert.equal(response.statusCode, 200);
+    }
+  });
+});
+
+test('discovery endpoint normalization does not accept unsupported lookalike paths', async () => {
+  await withHelper(async helper => {
+    for (const pathName of ['/json/version/extra/', '/json/list/extra/', '/json/protocol/extra/']) {
+      const response = await httpGet(helper.cdpPort, pathName);
+      assert.equal(response.statusCode, 404);
+      assert.equal(JSON.parse(response.body).path, pathName);
+    }
+  });
+});
+
+test('discovery endpoint normalization preserves query strings', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const pending = httpGet(helper.cdpPort, '/json/version/?v=1');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/json\/version\?v=1 HTTP\/1\.1/m);
+    const body = JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${helper.cdpPort}/devtools/browser/test` });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
   });
 });
 
@@ -372,6 +428,34 @@ test('tunnel health endpoint returns bridge metadata', async () => {
     assert.equal(body.ok, true);
     assert.equal(body.cdpPort, helper.cdpPort);
     assert.equal(body.tunnelPort, helper.tunnelPort);
+  });
+});
+
+test('helper serves diagnostics checker script from any working directory', async () => {
+  await withHelper(async helper => {
+    const response = await httpGet(helper.cdpPort, '/bridgewright/check-endpoint.js');
+    assert.equal(response.statusCode, 200);
+    assert.match(response.headers['content-type'], /application\/javascript/);
+    assert.match(response.body, /bridgewright checker/);
+  });
+});
+
+test('helper health reports connector readiness', async () => {
+  await withHelper(async helper => {
+    let response = await httpGet(helper.cdpPort, '/bridgewright/health');
+    assert.equal(response.statusCode, 200);
+    let body = JSON.parse(response.body);
+    assert.equal(body.ok, true);
+    assert.equal(body.cdpReady, false);
+    assert.equal(body.idleConnectorCount, 0);
+
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    response = await httpGet(helper.cdpPort, '/bridgewright/diagnose');
+    assert.equal(response.statusCode, 200);
+    body = JSON.parse(response.body);
+    assert.equal(body.cdpReady, true);
+    assert.equal(body.idleConnectorCount, 1);
+    tunnel.close();
   });
 });
 

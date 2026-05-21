@@ -4,6 +4,8 @@ export interface RemoteLauncherOptions {
   readonly logPath: string;
   readonly cdpPort: number;
   readonly tunnelPort: number;
+  readonly connectorTimeoutMs?: number;
+  readonly discoveryTimeoutMs?: number;
 }
 
 export function remoteShellQuote(value: string): string {
@@ -36,7 +38,11 @@ export function createRemoteLauncherScript(options: RemoteLauncherOptions): stri
     '    --ready-file \\',
     `    ${readyPath} \\`,
     '    --runtime-log \\',
-    `    ${logPath}`,
+    `    ${logPath} \\`,
+    '    --connector-timeout-ms \\',
+    `    ${options.connectorTimeoutMs ?? 3000} \\`,
+    '    --discovery-timeout-ms \\',
+    `    ${options.discoveryTimeoutMs ?? 20000}`,
     '} >> "$log" 2>&1',
     '',
   ].join('\n');

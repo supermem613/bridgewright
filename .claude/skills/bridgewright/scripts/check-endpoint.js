@@ -14,10 +14,11 @@ const STATE_FILE = path.join(os.homedir(), '.bridgewright', 'endpoint.json');
 
 const USAGE = `
 Usage:
-  node .claude/skills/bridgewright/scripts/check-endpoint.js [--endpoint <url>] [--timeout-ms <ms>] [--playwright]
+  node .claude/skills/bridgewright/scripts/check-endpoint.js [--endpoint <url>] [--timeout-ms <ms>] [--playwright] [--diagnose]
 
-Checks /json/version and /json/list for the Bridgewright CDP endpoint.
+Checks /json/version, /json/version/, and /json/list for the Bridgewright CDP endpoint.
 Use --playwright to also verify chromium.connectOverCDP.
+Use --diagnose to include Bridgewright health and, when Playwright is available, a non-mutating browser context/page/frame snapshot.
 
 Output:
   JSON only on stdout.
@@ -32,7 +33,8 @@ function parseArgs(argv) {
   const result = {
     endpoint: undefined,
     timeoutMs: 2000,
-    playwright: false
+    playwright: false,
+    diagnose: false
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -59,6 +61,10 @@ function parseArgs(argv) {
     }
     if (arg === '--playwright') {
       result.playwright = true;
+      continue;
+    }
+    if (arg === '--diagnose') {
+      result.diagnose = true;
       continue;
     }
     failArgs(`Unknown argument: ${arg}`);
@@ -99,7 +105,10 @@ function getJson(url, timeoutMs) {
       });
       response.on('end', () => {
         if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`HTTP ${response.statusCode || 'unknown'}`));
+          const error = new Error(`HTTP ${response.statusCode || 'unknown'}${body ? `: ${body.slice(0, 500)}` : ''}`);
+          error.statusCode = response.statusCode;
+          error.body = body;
+          reject(error);
           return;
         }
         try {
@@ -117,44 +126,115 @@ function getJson(url, timeoutMs) {
   });
 }
 
-async function check(endpoint, source, timeoutMs, includePlaywright) {
+async function tryReadHealth(endpoint, timeoutMs) {
+  try {
+    return await getJson(`${endpoint.replace(/\/$/, '')}/bridgewright/health`, timeoutMs);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message
+    };
+  }
+}
+
+async function check(endpoint, source, timeoutMs, includePlaywright, includeDiagnostics) {
   const normalized = endpoint.replace(/\/$/, '');
+  const health = includeDiagnostics ? await tryReadHealth(normalized, timeoutMs) : undefined;
   const version = await getJson(`${normalized}/json/version`, timeoutMs);
   if (!version.webSocketDebuggerUrl) {
     throw new Error('Missing webSocketDebuggerUrl in /json/version response');
+  }
+  const versionWithSlash = await getJson(`${normalized}/json/version/`, timeoutMs);
+  if (!versionWithSlash.webSocketDebuggerUrl) {
+    throw new Error('Missing webSocketDebuggerUrl in /json/version/ response');
   }
   const targets = await getJson(`${normalized}/json/list`, timeoutMs);
   if (!Array.isArray(targets)) {
     throw new Error('Expected /json/list to return an array');
   }
   let playwrightResult;
-  if (includePlaywright) {
-    playwrightResult = await checkPlaywright(normalized, timeoutMs);
+  if (includePlaywright || includeDiagnostics) {
+    playwrightResult = await checkPlaywright(normalized, timeoutMs, includeDiagnostics, includePlaywright);
   }
   return {
     ok: true,
     endpoint: normalized,
     source,
+    health,
     browser: version.Browser || null,
     protocolVersion: version['Protocol-Version'] || null,
     webSocketDebuggerUrl: version.webSocketDebuggerUrl,
+    trailingSlashWebSocketDebuggerUrl: versionWithSlash.webSocketDebuggerUrl,
+    cdpDiscovery: {
+      version: true,
+      versionSlash: true,
+      list: true
+    },
     targetCount: targets.length,
+    targets: targets.map(summarizeTarget),
     playwright: playwrightResult
   };
 }
 
-async function checkPlaywright(endpoint, timeoutMs) {
+function summarizeTarget(target) {
+  return {
+    id: typeof target.id === 'string' ? target.id : null,
+    type: typeof target.type === 'string' ? target.type : null,
+    title: typeof target.title === 'string' ? target.title : null,
+    url: typeof target.url === 'string' ? target.url : null,
+    webSocketDebuggerUrl: typeof target.webSocketDebuggerUrl === 'string' ? target.webSocketDebuggerUrl : null
+  };
+}
+
+async function safePageTitle(page) {
+  try {
+    return await page.title();
+  } catch (error) {
+    return `title unavailable: ${error.message}`;
+  }
+}
+
+async function describeContext(context, contextIndex) {
+  const pages = context.pages();
+  return {
+    index: contextIndex,
+    pageCount: pages.length,
+    pages: await Promise.all(pages.map(async (page, pageIndex) => ({
+      index: pageIndex,
+      url: page.url(),
+      title: await safePageTitle(page),
+      frames: page.frames().map((frame, frameIndex) => ({
+        index: frameIndex,
+        name: frame.name(),
+        url: frame.url()
+      }))
+    })))
+  };
+}
+
+async function checkPlaywright(endpoint, timeoutMs, includeDiagnostics, requirePlaywright) {
   let playwright;
   try {
     playwright = await import('playwright');
   } catch (error) {
+    if (!requirePlaywright) {
+      return {
+        skipped: true,
+        reason: `playwright package not available: ${error.message}`
+      };
+    }
     throw new Error(`Playwright import failed: ${error.message}`);
   }
   const browser = await playwright.chromium.connectOverCDP(endpoint, { timeout: timeoutMs });
   try {
+    const contexts = browser.contexts();
+    const diagnostics = includeDiagnostics
+      ? { contexts: await Promise.all(contexts.map((context, index) => describeContext(context, index))) }
+      : undefined;
     return {
       connected: browser.isConnected(),
-      contextCount: browser.contexts().length
+      contextCount: contexts.length,
+      diagnostics
     };
   } finally {
     await browser.close();
@@ -178,14 +258,15 @@ async function main() {
   const failures = [];
   for (const candidate of candidates) {
     try {
-      const result = await check(candidate.endpoint, candidate.source, args.timeoutMs, args.playwright);
+      const result = await check(candidate.endpoint, candidate.source, args.timeoutMs, args.playwright, args.diagnose);
       process.stdout.write(JSON.stringify(result) + '\n');
       return;
     } catch (error) {
       failures.push({
         endpoint: candidate.endpoint,
         source: candidate.source,
-        error: error.message
+        error: error.message,
+        health: await tryReadHealth(candidate.endpoint, args.timeoutMs)
       });
     }
   }

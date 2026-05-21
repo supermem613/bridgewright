@@ -56,7 +56,7 @@ function runChecker(args) {
 
 test('check-endpoint verifies version and target list', async () => {
   await withServer((request, response) => {
-    if (request.url === '/json/version') {
+    if (request.url === '/json/version' || request.url === '/json/version/') {
       response.end(JSON.stringify({
         Browser: 'BridgewrightTest/1',
         'Protocol-Version': '1.3',
@@ -82,7 +82,7 @@ test('check-endpoint verifies version and target list', async () => {
 
 test('check-endpoint fails when /json/list is not an array', async () => {
   await withServer((request, response) => {
-    if (request.url === '/json/version') {
+    if (request.url === '/json/version' || request.url === '/json/version/') {
       response.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:1/devtools/browser/test' }));
       return;
     }
@@ -101,8 +101,104 @@ test('check-endpoint fails when /json/list is not an array', async () => {
   });
 });
 
+test('check-endpoint includes Bridgewright health on endpoint failure', async () => {
+  await withServer((request, response) => {
+    if (request.url === '/bridgewright/health') {
+      response.end(JSON.stringify({
+        ok: true,
+        cdpReady: false,
+        idleConnectorCount: 0,
+      }));
+      return;
+    }
+    response.writeHead(503, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'Bridgewright local connector unavailable' }));
+  }, async endpoint => {
+    const result = await runChecker(['--endpoint', endpoint]);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, false);
+    assert.match(output.checked[0].error, /HTTP 503/);
+    assert.match(output.checked[0].error, /Bridgewright local connector unavailable/);
+    assert.equal(output.checked[0].health.cdpReady, false);
+    assert.equal(output.checked[0].health.idleConnectorCount, 0);
+  });
+});
+
+test('check-endpoint catches missing trailing-slash discovery support', async () => {
+  await withServer((request, response) => {
+    if (request.url === '/json/version') {
+      response.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:1/devtools/browser/test' }));
+      return;
+    }
+    if (request.url === '/json/list') {
+      response.end(JSON.stringify([]));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  }, async endpoint => {
+    const result = await runChecker(['--endpoint', endpoint]);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, false);
+    assert.match(output.checked[0].error, /HTTP 404/);
+  });
+});
+
 test('check-endpoint rejects invalid timeout arguments', async () => {
   const result = await runChecker(['--timeout-ms', '0']);
   assert.equal(result.status, 2);
   assert.equal(JSON.parse(result.stdout).ok, false);
+});
+
+test('check-endpoint diagnose skips Playwright when package is unavailable', async () => {
+  await withServer((request, response) => {
+    if (request.url === '/bridgewright/health') {
+      response.end(JSON.stringify({ ok: true, cdpReady: true }));
+      return;
+    }
+    if (request.url === '/json/version' || request.url === '/json/version/') {
+      response.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:1/devtools/browser/test' }));
+      return;
+    }
+    if (request.url === '/json/list') {
+      response.end(JSON.stringify([{ id: 'page-1', type: 'page', title: 'Page 1', url: 'about:blank' }]));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  }, async endpoint => {
+    const result = await runChecker(['--endpoint', endpoint, '--diagnose']);
+    assert.equal(result.status, 0);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, true);
+    assert.equal(output.health.cdpReady, true);
+    assert.equal(output.cdpDiscovery.version, true);
+    assert.equal(output.cdpDiscovery.versionSlash, true);
+    assert.equal(output.cdpDiscovery.list, true);
+    assert.equal(output.playwright.skipped, true);
+    assert.match(output.playwright.reason, /playwright package not available/);
+  });
+});
+
+test('check-endpoint playwright mode requires Playwright when requested', async () => {
+  await withServer((request, response) => {
+    if (request.url === '/json/version' || request.url === '/json/version/') {
+      response.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1:1/devtools/browser/test' }));
+      return;
+    }
+    if (request.url === '/json/list') {
+      response.end(JSON.stringify([{ id: 'page-1', type: 'page', title: 'Page 1', url: 'about:blank' }]));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  }, async endpoint => {
+    const result = await runChecker(['--endpoint', endpoint, '--playwright']);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, false);
+    assert.match(output.checked[0].error, /Playwright import failed/);
+  });
 });

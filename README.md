@@ -44,7 +44,11 @@ Run the full live smoke from the Codespace after the status bar shows `Bridgewri
 ```bash
 node .claude/skills/bridgewright/scripts/check-endpoint.js --timeout-ms 5000
 node .claude/skills/bridgewright/scripts/check-endpoint.js --timeout-ms 20000 --playwright
+node .claude/skills/bridgewright/scripts/check-endpoint.js --timeout-ms 20000 --diagnose
+curl -fsSL http://127.0.0.1:37373/bridgewright/check-endpoint.js | node - --diagnose --timeout-ms 20000
 ```
+
+`--diagnose` is repo-independent. If Playwright is not installed in the current repo, the checker still returns `ok: true` when HTTP/CDP health is green and marks the Playwright snapshot as skipped. Use `--playwright` when Playwright attach must be a required gate.
 
 ## Commands
 
@@ -101,11 +105,13 @@ If the helper is ready but Playwright cannot connect, run:
 curl --max-time 5 http://127.0.0.1:37373/json/version
 curl --max-time 5 http://127.0.0.1:37373/json/list
 node .claude/skills/bridgewright/scripts/check-endpoint.js --playwright --timeout-ms 20000
+node .claude/skills/bridgewright/scripts/check-endpoint.js --diagnose --timeout-ms 20000
+curl -fsSL http://127.0.0.1:37373/bridgewright/check-endpoint.js | node - --diagnose --timeout-ms 20000
 ```
 
 ## How it works
 
-Bridgewright starts a small helper inside the Codespace that listens on `127.0.0.1:37373`. Start only arms the bridge. Your Playwright code connects to that endpoint, and the first CDP bytes trigger local Edge startup. The local VS Code extension connects back through VS Code-forwarded WebSocket tunnels and pipes CDP bytes to Edge.
+Bridgewright starts a small helper inside the Codespace that listens on `127.0.0.1:37373`. Start arms the bridge. Your Playwright code connects to that endpoint, and the first CDP bytes trigger local Edge startup. The local VS Code extension connects back through VS Code-forwarded WebSocket tunnels and pipes CDP bytes to Edge.
 
 By default Bridgewright uses the permanent Edge user data root at `%LOCALAPPDATA%\Microsoft\Edge\User Data`. Override `bridgewright.edgeUserDataDir` if you want a dedicated automation profile instead.
 

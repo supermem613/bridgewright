@@ -65,12 +65,14 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 const cdpPort = Number.parseInt(args.get('--cdp-port') || '37373', 10);
 const tunnelPort = Number.parseInt(args.get('--tunnel-port') || '37374', 10);
-const discoveryTimeoutMs = Number.parseInt(args.get('--discovery-timeout-ms') || '5000', 10);
+const connectorTimeoutMs = Number.parseInt(args.get('--connector-timeout-ms') || '3000', 10);
+const discoveryTimeoutMs = Number.parseInt(args.get('--discovery-timeout-ms') || '20000', 10);
 const replaceExisting = args.has('--replace-existing');
 const readyFile = args.get('--ready-file');
 const runtimeLog = args.get('--runtime-log');
 const root = path.join(os.homedir(), '.bridgewright');
 const logs = path.join(root, 'logs');
+const checkerScriptFile = path.join(path.dirname(path.resolve(process.argv[1])), 'bridgewright-check-endpoint.js');
 fs.mkdirSync(logs, { recursive: true });
 
 function log(message) {
@@ -96,6 +98,13 @@ function writeState(status, extra = {}) {
   fs.writeFileSync(path.join(root, 'status.json'), JSON.stringify(payload, null, 2) + '\n');
 }
 
+function writeWaitingForConnectorState() {
+  writeState('starting', {
+    cdpReady: false,
+    detail: 'Waiting for a local Bridgewright connector'
+  });
+}
+
 function writeReady(status, extra = {}) {
   if (!readyFile) return;
   const payload = {
@@ -118,7 +127,7 @@ function stopExistingHelpers() {
   }
   const self = process.pid;
   const scriptPath = path.resolve(process.argv[1]);
-  let stopped = 0;
+  const stopped = [];
   for (const entry of fs.readdirSync('/proc')) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number.parseInt(entry, 10);
@@ -130,14 +139,29 @@ function stopExistingHelpers() {
       if (candidate) {
         process.kill(pid, 'SIGTERM');
         log('stopped existing helper pid=' + pid);
-        stopped += 1;
+        stopped.push(pid);
       }
     } catch {
       // Process disappeared or is not readable.
     }
   }
-  if (stopped > 0) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+  const deadline = Date.now() + 750;
+  let remaining = stopped;
+  while (remaining.length > 0 && Date.now() < deadline) {
+    remaining = remaining.filter(pid => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (remaining.length > 0) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  if (remaining.length > 0) {
+    log('existing helper pid(s) still exiting: ' + remaining.join(','));
   }
 }
 
@@ -243,6 +267,9 @@ function addTunnel(tunnel) {
   tunnel.onClose(() => {
     const index = idleTunnels.indexOf(tunnel);
     if (index >= 0) idleTunnels.splice(index, 1);
+    if (idleTunnels.length === 0) {
+      writeWaitingForConnectorState();
+    }
   });
   if (waiters.length > 0) {
     const waiter = waiters.shift();
@@ -251,9 +278,13 @@ function addTunnel(tunnel) {
   } else {
     idleTunnels.push(tunnel);
   }
+  writeState('running', {
+    cdpReady: true,
+    connectorCount: idleTunnels.length
+  });
 }
 
-function takeTunnel(timeoutMs = discoveryTimeoutMs) {
+function takeTunnel(timeoutMs = connectorTimeoutMs) {
   const tunnel = idleTunnels.shift();
   if (tunnel) return Promise.resolve(tunnel);
   return new Promise((resolve, reject) => {
@@ -313,7 +344,48 @@ function sendJson(response, statusCode, payload) {
   response.end(body);
 }
 
-function serializeRequest(request) {
+function serveBridgewrightHealth(response) {
+  sendJson(response, 200, {
+    ok: true,
+    endpoint: 'http://127.0.0.1:' + cdpPort,
+    cdpPort,
+    tunnelPort,
+    cdpReady: idleTunnels.length > 0,
+    idleConnectorCount: idleTunnels.length,
+    pendingRequestCount: waiters.length,
+    owner: 'bridgewright'
+  });
+}
+
+function serveCheckerScript(request, response) {
+  if (request.method !== 'GET') {
+    sendJson(response, 404, { error: 'Unsupported Bridgewright diagnostics path', path: request.url || '/' });
+    return;
+  }
+  fs.readFile(checkerScriptFile, (error, body) => {
+    if (error) {
+      sendJson(response, 404, { error: 'Bridgewright diagnostic checker script is unavailable', path: checkerScriptFile });
+      return;
+    }
+    response.writeHead(200, {
+      'content-type': 'application/javascript; charset=utf-8',
+      'content-length': body.length,
+      connection: 'close'
+    });
+    response.end(body);
+  });
+}
+
+function normalizeDiscoveryUrl(rawUrl) {
+  const parsed = new URL(rawUrl || '/', 'http://127.0.0.1');
+  const routePath = parsed.pathname === '/' ? '/' : parsed.pathname.replace(/\/+$/, '');
+  return {
+    routePath,
+    targetUrl: routePath + parsed.search
+  };
+}
+
+function serializeRequest(request, targetUrl) {
   const headers = [];
   const seen = new Set();
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
@@ -331,7 +403,7 @@ function serializeRequest(request) {
   }
   if (!seen.has('host')) headers.push('Host: 127.0.0.1:' + cdpPort);
   headers.push('Connection: close');
-  return Buffer.from(request.method + ' ' + request.url + ' HTTP/' + request.httpVersion + '\r\n' + headers.join('\r\n') + '\r\n\r\n');
+  return Buffer.from(request.method + ' ' + targetUrl + ' HTTP/' + request.httpVersion + '\r\n' + headers.join('\r\n') + '\r\n\r\n');
 }
 
 function serializeUpgradeRequest(request, head) {
@@ -382,25 +454,34 @@ function parseHttpResponseHead(buffer) {
 
 async function proxyHttpRequest(request, response) {
   const url = request.url || '/';
-  if (request.method !== 'GET' || !['/json/version', '/json/list', '/json', '/json/protocol'].includes(url)) {
+  if (new URL(url, 'http://127.0.0.1').pathname === '/bridgewright/check-endpoint.js') {
+    serveCheckerScript(request, response);
+    return;
+  }
+  if (['/bridgewright/health', '/bridgewright/diagnose'].includes(new URL(url, 'http://127.0.0.1').pathname)) {
+    serveBridgewrightHealth(response);
+    return;
+  }
+  const normalized = normalizeDiscoveryUrl(url);
+  if (request.method !== 'GET' || !['/json/version', '/json/list', '/json', '/json/protocol'].includes(normalized.routePath)) {
     sendJson(response, 404, { error: 'Unsupported CDP discovery path', path: url });
     return;
   }
 
-  log('cdp http request ' + request.method + ' ' + url);
+  log('cdp http request ' + request.method + ' ' + normalized.targetUrl);
   let tunnel;
   try {
     tunnel = await takeTunnel();
   } catch (error) {
-    log('failed to acquire tunnel for ' + url + ': ' + error.message);
+    log('failed to acquire tunnel for ' + normalized.targetUrl + ': ' + error.message);
     sendJson(response, 503, { error: 'Bridgewright local connector unavailable', detail: error.message });
     return;
   }
 
   const timer = setTimeout(() => {
-    log('cdp http request timed out ' + url);
+    log('cdp http request timed out ' + normalized.targetUrl);
     if (!response.headersSent) {
-      sendJson(response, 503, { error: 'Timed out waiting for host browser CDP response', path: url });
+      sendJson(response, 503, { error: 'Timed out waiting for host browser CDP response', path: normalized.targetUrl });
     } else {
       response.end();
     }
@@ -436,7 +517,7 @@ async function proxyHttpRequest(request, response) {
     clearTimeout(timer);
     tunnel.close();
   });
-  tunnel.send(serializeRequest(request));
+  tunnel.send(serializeRequest(request, normalized.targetUrl));
 }
 
 const cdpServer = http.createServer((request, response) => {
@@ -473,7 +554,7 @@ let cdpListening = false;
 
 function maybeReady() {
   if (!tunnelListening || !cdpListening) return;
-  writeState('running');
+  writeWaitingForConnectorState();
   writeReady('running');
   log('ready cdp=' + cdpPort + ' tunnel=' + tunnelPort + ' pid=' + process.pid);
   console.log('BRIDGEWRIGHT_READY ' + JSON.stringify({ cdpPort, tunnelPort }));
@@ -582,7 +663,7 @@ export class BridgeManager implements vscode.Disposable {
       const remoteHelper = await this.startRemoteHelper(workspaceFolder, port, tunnelPort);
       await this.waitForRemoteHelper(remoteHelper);
       const tunnelUri = await this.resolveTunnelUri(tunnelPort);
-      this.startConnectorPool(tunnelUri, port);
+      await this.startConnectorPool(tunnelUri, port);
 
       const endpoint = `http://127.0.0.1:${port}`;
       this.state = {
@@ -595,7 +676,6 @@ export class BridgeManager implements vscode.Disposable {
       };
       await this.writeState(this.state);
       this.setStatus('running');
-      await vscode.env.clipboard.writeText(endpoint);
       vscode.window.showInformationMessage(`Bridgewright running at ${endpoint}`);
     } catch (error) {
       await this.stopProcesses();
@@ -938,22 +1018,27 @@ export class BridgeManager implements vscode.Disposable {
   private async startRemoteHelper(workspaceFolder: vscode.WorkspaceFolder, port: number, tunnelPort: number): Promise<RemoteHelper> {
     const runtimeDir = vscode.Uri.joinPath(workspaceFolder.uri, '.bridgewright-runtime');
     const helperUri = vscode.Uri.joinPath(runtimeDir, 'bridgewright-helper.js');
+    const checkerUri = vscode.Uri.joinPath(runtimeDir, 'bridgewright-check-endpoint.js');
     const runId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const readyUri = vscode.Uri.joinPath(runtimeDir, `ready-${runId}.json`);
     const logUri = vscode.Uri.joinPath(runtimeDir, `helper-${runId}.log`);
     const launcherUri = vscode.Uri.joinPath(runtimeDir, `launch-${runId}.sh`);
     await vscode.workspace.fs.createDirectory(runtimeDir);
     await vscode.workspace.fs.writeFile(helperUri, Buffer.from(HELPER_SCRIPT, 'utf8'));
+    await vscode.workspace.fs.writeFile(checkerUri, await this.readBundledCheckerScript());
     await vscode.workspace.fs.writeFile(launcherUri, Buffer.from(createRemoteLauncherScript({
       helperPath: this.remoteTerminalPath(helperUri),
       readyPath: this.remoteTerminalPath(readyUri),
       logPath: this.remoteTerminalPath(logUri),
       cdpPort: port,
       tunnelPort,
+      connectorTimeoutMs: 3000,
+      discoveryTimeoutMs: 20000,
     }), 'utf8'));
 
     this.helperTerminal?.dispose();
     this.log(`Writing remote helper to ${helperUri.toString()}`);
+    this.log(`Writing remote diagnostics checker to ${checkerUri.toString()}`);
     this.log(`Writing remote launcher to ${launcherUri.toString()}`);
     this.helperTerminal = vscode.window.createTerminal({
       name: 'Bridgewright Helper',
@@ -967,7 +1052,13 @@ export class BridgeManager implements vscode.Disposable {
     this.log(`Started remote helper ${this.remoteTerminalPath(helperUri)}`);
     this.log(`Remote helper ready file: ${readyUri.toString()}`);
     this.log(`Remote helper workspace log: ${logUri.toString()}`);
+    this.log(`Remote diagnostics command: curl -fsSL http://127.0.0.1:${port}/bridgewright/check-endpoint.js | node - --diagnose --timeout-ms 20000`);
     return { readyUri, logUri };
+  }
+
+  private async readBundledCheckerScript(): Promise<Uint8Array> {
+    const checkerUri = vscode.Uri.joinPath(this.context.extensionUri, '.claude', 'skills', 'bridgewright', 'scripts', 'check-endpoint.js');
+    return vscode.workspace.fs.readFile(checkerUri);
   }
 
   private async resolveTunnelUri(remoteTunnelPort: number): Promise<URL> {
@@ -977,23 +1068,36 @@ export class BridgeManager implements vscode.Disposable {
     return tunnelUri;
   }
 
-  private startConnectorPool(tunnelUri: URL, edgePort: number): void {
+  private async startConnectorPool(tunnelUri: URL, edgePort: number): Promise<void> {
     this.connectorAbort?.abort();
     const abort = new AbortController();
     this.connectorAbort = abort;
     const poolSize = this.readConnectorPoolSize();
+    let armed = false;
+    let resolveFirstArmed!: () => void;
+    const firstArmed = new Promise<void>(resolve => {
+      resolveFirstArmed = resolve;
+    });
+    const onArmed = (): void => {
+      if (!armed) {
+        armed = true;
+        resolveFirstArmed();
+      }
+    };
     for (let index = 0; index < poolSize; index++) {
-      void this.runConnectorLoop(tunnelUri, edgePort, abort.signal, index + 1);
+      void this.runConnectorLoop(tunnelUri, edgePort, abort.signal, index + 1, onArmed);
     }
     this.log(`Started ${poolSize} connector loop(s)`);
+    await this.withTimeout(firstArmed, 10_000, 'No Bridgewright connector armed within 10000ms');
   }
 
-  private async runConnectorLoop(tunnelUri: URL, edgePort: number, signal: AbortSignal, connectorId: number): Promise<void> {
+  private async runConnectorLoop(tunnelUri: URL, edgePort: number, signal: AbortSignal, connectorId: number, onArmed: () => void): Promise<void> {
     while (!signal.aborted) {
       try {
         this.log(`Connector ${connectorId} connecting to tunnel ${tunnelUri.toString()}`);
         const tunnel = await this.connectWebSocketTunnel(tunnelUri, signal);
         this.log(`Connector ${connectorId} armed`);
+        onArmed();
         const pendingPayloads: Buffer[] = [];
         let firstPayloadResolver: (() => void) | undefined;
         let edge: net.Socket | undefined;
@@ -1041,7 +1145,7 @@ export class BridgeManager implements vscode.Disposable {
       } catch (error) {
         if (!signal.aborted) {
           this.log(`Connector ${connectorId} retry: ${this.errorMessage(error)}`);
-          await this.delay(500);
+          await this.waitForAbortOrTimeout(signal, 500);
         }
       }
     }
@@ -1081,6 +1185,40 @@ export class BridgeManager implements vscode.Disposable {
 
   private onceClose(socket: net.Socket): Promise<void> {
     return new Promise(resolve => socket.once('close', () => resolve()));
+  }
+
+  private withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      operation.then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        error => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private waitForAbortOrTimeout(signal: AbortSignal, timeoutMs: number): Promise<void> {
+    return new Promise(resolve => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      let timer: NodeJS.Timeout;
+      const onAbort = (): void => cleanup();
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      timer = setTimeout(cleanup, timeoutMs);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   private async ensureEdgeStarted(port: number): Promise<CdpVersion> {

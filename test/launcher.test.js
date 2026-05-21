@@ -28,6 +28,8 @@ test('remote launcher script invokes helper with stable argv and diagnostics', (
   assert.match(script, /--tunnel-port \\\n    37374 \\/);
   assert.match(script, /--ready-file \\/);
   assert.match(script, /--runtime-log \\/);
+  assert.match(script, /--connector-timeout-ms \\\n    3000 \\/);
+  assert.match(script, /--discovery-timeout-ms \\\n    20000/);
   assert.match(script, /\} >> "\$log" 2>&1\n$/);
   assert.doesNotMatch(script, /[A-Za-z]:\\/);
   assert.doesNotMatch(script, /\\workspaces/);

@@ -34,7 +34,6 @@ Expected `endpoint.json` shape:
   "endpoint": "http://127.0.0.1:37373",
   "port": 37373,
   "protocol": "cdp",
-  "browser": "Edg/149.0.4022.16",
   "status": "running",
   "owner": "bridgewright",
   "updatedAt": "2026-05-21T18:36:00.000Z"
@@ -64,6 +63,20 @@ Use the bundled checker before running browser automation:
 ```bash
 node .claude/skills/bridgewright/scripts/check-endpoint.js
 ```
+
+For downstream app-readiness bugs, include a non-mutating browser snapshot:
+
+```bash
+node .claude/skills/bridgewright/scripts/check-endpoint.js --diagnose --timeout-ms 20000
+```
+
+If the current repo does not contain the Bridgewright skill files, fetch the checker from the running endpoint:
+
+```bash
+curl -fsSL http://127.0.0.1:37373/bridgewright/check-endpoint.js | node - --diagnose --timeout-ms 20000
+```
+
+`--diagnose` must remain repo-independent. If Playwright is unavailable, it should return `ok: true` when HTTP/CDP health is green and include `playwright.skipped: true`. Use `--playwright` only when attach verification is required and the repo can resolve the Playwright package.
 
 Machine-readable output is JSON on stdout. A successful result includes:
 
