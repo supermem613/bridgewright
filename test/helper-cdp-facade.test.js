@@ -313,6 +313,27 @@ test('/json/version proxies through tunnel and closes response', async () => {
   });
 });
 
+test('/json/version rewrites root websocket URL and completes before tunnel close', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const pending = httpGet(helper.cdpPort, '/json/version');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/json\/version HTTP\/1\.1/m);
+
+    const body = JSON.stringify({
+      Browser: 'BridgewrightTest/1',
+      'Protocol-Version': '1.3',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/test',
+    });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`);
+
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    assert.equal(JSON.parse(response.body).webSocketDebuggerUrl, `ws://127.0.0.1:${helper.cdpPort}/devtools/browser/test`);
+    tunnel.close();
+  });
+});
+
 test('/json and /json/list proxy discovery endpoints', async () => {
   await withHelper(async helper => {
     for (const pathName of ['/json', '/json/list']) {

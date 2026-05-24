@@ -73,7 +73,7 @@ To run only that e2e:
 npm run e2e:local
 ```
 
-The local e2e starts the embedded helper on random localhost ports, drives the real Bridgewright connector code, verifies default-profile navigation and close behavior, rejects default profile close through the management API, verifies default can reopen, verifies named profiles navigate independently, verifies final CDP disconnect cleanup, verifies one client disconnect does not close a profile while another client remains connected, verifies `remove` stops and deletes named profiles, and finally verifies default still works after named-profile cleanup. This does not cover VS Code activation, status bar commands, or `vscode.env.asExternalUri`.
+The local e2e starts the embedded helper on random localhost ports, drives the real Bridgewright connector code, verifies locked default-profile discovery fails promptly instead of hanging, verifies default-profile navigation and close behavior, rejects default profile close through the management API, verifies default can reopen, verifies named profiles navigate independently, verifies final CDP disconnect cleanup, verifies one client disconnect does not close a profile while another client remains connected, verifies `remove` stops and deletes named profiles, and finally verifies default still works after named-profile cleanup. This does not cover VS Code activation, status bar commands, or `vscode.env.asExternalUri`.
 
 ## Commands
 
@@ -145,14 +145,14 @@ curl -X POST http://127.0.0.1:37373/profiles/kash-work/close
 curl -X POST http://127.0.0.1:37373/profiles/kash-work/remove
 ```
 
-Profile names must match `[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}`. `close` and `remove` are idempotent for named profiles and reject `default`. Named profiles also close automatically after the last profile-scoped CDP connection disconnects. Set `bridgewright.closeNamedProfilesOnDisconnect` to `false` to keep named profiles alive until an explicit close or remove request.
+Profile names must match `[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}`. `close` and `remove` are idempotent for named profiles and reject `default`. The default browser window closes automatically after the last root CDP connection disconnects, while its profile data remains durable. Named profiles also close automatically after the last profile-scoped CDP connection disconnects and their profile data is removed. Set `bridgewright.closeDefaultProfileOnDisconnect` or `bridgewright.closeNamedProfilesOnDisconnect` to `false` to keep profile windows alive after CDP disconnect.
 
 ## How it works
 
 Bridgewright starts a small helper inside the Codespace that listens on `127.0.0.1:37373`. Start arms the bridge. Your Playwright code connects to that endpoint, and the first CDP bytes trigger local Edge startup. The local VS Code extension connects back through VS Code-forwarded WebSocket tunnels and pipes CDP bytes to Edge.
 
-By default Bridgewright uses the permanent Edge user data root at `%LOCALAPPDATA%\Microsoft\Edge\User Data`. Override `bridgewright.edgeUserDataDir` if you want a dedicated durable default automation profile instead. Named profiles always use Bridgewright-owned ephemeral storage and are cleaned on Bridgewright start, stop, explicit close/remove, or final CDP disconnect.
+By default Bridgewright uses a dedicated durable default automation profile at `%USERPROFILE%\.bridgewright\default-edge-user-data`. Override `bridgewright.edgeUserDataDir` if you want a different default automation profile. Set `bridgewright.useSystemEdgeUserDataDirByDefault` to `true` only if you need the old behavior that points the default profile at `%LOCALAPPDATA%\Microsoft\Edge\User Data`; that profile can be locked by an already-running Edge instance. Named profiles always use Bridgewright-owned ephemeral storage and are cleaned on Bridgewright start, stop, explicit close/remove, or final CDP disconnect.
 
-If the Edge window is closed, Bridgewright closes that CDP socket, keeps the status bar bridge running, and waits for the next incoming connection.
+If the Edge window is closed, Bridgewright closes that CDP socket, keeps the status bar bridge running, and waits for the next incoming connection. If the CDP client disconnects first, Bridgewright closes the browser window and keeps the bridge armed for the next connection.
 
 CDP traffic uses sockets. It is never proxied over VS Code command RPC.

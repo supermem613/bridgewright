@@ -98,7 +98,7 @@ async function reservePortPair() {
   };
 }
 
-function installVscodeShim(defaultProfilePath) {
+function installVscodeShim(defaultProfilePath, configOverrides = {}) {
   const originalLoad = Module._load;
   const outputLines = [];
   const shim = {
@@ -144,6 +144,7 @@ function installVscodeShim(defaultProfilePath) {
         assert.equal(section, 'bridgewright');
         return {
           get(name, fallback) {
+            if (Object.prototype.hasOwnProperty.call(configOverrides, name)) return configOverrides[name];
             if (name === 'edgeUserDataDir') return defaultProfilePath;
             if (name === 'connectorPoolSize') return 4;
             return fallback;
@@ -184,7 +185,13 @@ function installVscodeShim(defaultProfilePath) {
   };
 }
 
-async function startHelper(root, cdpPort, tunnelPort) {
+function loadBridgeManager() {
+  const managerPath = require.resolve('../dist/manager.js');
+  delete require.cache[managerPath];
+  return require(managerPath).BridgeManager;
+}
+
+async function startHelper(root, cdpPort, tunnelPort, options = {}) {
   const runtimeRoot = path.join(root, 'helper-runtime');
   const remoteStateRoot = path.join(root, 'remote-state');
   await fs.promises.mkdir(runtimeRoot, { recursive: true });
@@ -206,9 +213,9 @@ async function startHelper(root, cdpPort, tunnelPort) {
     '--root',
     remoteStateRoot,
     '--connector-timeout-ms',
-    '3000',
+    String(options.connectorTimeoutMs ?? 3000),
     '--discovery-timeout-ms',
-    '20000',
+    String(options.discoveryTimeoutMs ?? 20000),
   ], { stdio: 'ignore' });
 
   try {
@@ -219,6 +226,7 @@ async function startHelper(root, cdpPort, tunnelPort) {
         const log = await readTextIfExists(logPath);
         throw new Error(`Helper failed: ${ready.error || 'unknown error'}${log ? `\n${log}` : ''}`);
       }
+
       return ready.status === 'running';
     }, 5000, 'Helper did not become ready');
   } catch (error) {
@@ -234,6 +242,54 @@ async function startHelper(root, cdpPort, tunnelPort) {
       }
     },
   };
+}
+
+async function runLockedDefaultProfileProbe(reporter = console) {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bridgewright-locked-default-'));
+  const defaultProfilePath = path.join(root, 'locked-default-edge-user-data');
+  await fs.promises.mkdir(defaultProfilePath, { recursive: true });
+  await fs.promises.writeFile(path.join(defaultProfilePath, 'SingletonLock'), 'locked', 'utf8');
+  const shim = installVscodeShim(defaultProfilePath, { connectorPoolSize: 1 });
+  const helperPorts = await reservePortPair();
+  let helper;
+  let manager;
+
+  try {
+    const BridgeManager = loadBridgeManager();
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 2000 });
+    manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
+    manager.rootPath = path.join(root, 'bridgewright-state');
+    manager.logsPath = path.join(manager.rootPath, 'logs');
+    manager.namedProfilesPath = path.join(manager.rootPath, 'profiles');
+    manager.statePath = path.join(manager.rootPath, 'state.json');
+    manager.profilePath = defaultProfilePath;
+    manager.state = {
+      status: 'running',
+      endpoint: `http://127.0.0.1:${helperPorts.cdpPort}`,
+      remotePort: helperPorts.cdpPort,
+      tunnelPort: helperPorts.tunnelPort,
+      profilePath: defaultProfilePath,
+      updatedAt: new Date().toISOString(),
+    };
+    await manager.ensureStorage();
+    manager.openLog();
+    manager.setStatus('running');
+    await manager.startConnectorPool(new URL(`http://127.0.0.1:${helperPorts.tunnelPort}/bridgewright-tunnel`));
+
+    const response = await httpRequest(helperPorts.cdpPort, '/json/version');
+    assert.equal(response.statusCode, 503);
+    assert.match(JSON.parse(response.body).error, /automation profile appears to be in use/);
+    reporter.log('Locked default profile discovery failure returns promptly: ok');
+  } finally {
+    if (manager) {
+      await manager.stopProcesses();
+    }
+    if (helper) {
+      helper.stop();
+    }
+    shim.restore();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
 }
 
 async function readTextIfExists(filePath) {
@@ -279,6 +335,22 @@ async function httpJson(port, requestPath, method = 'GET') {
     throw new Error(`${method} ${requestPath} returned HTTP ${response.statusCode}: ${response.body}`);
   }
   return JSON.parse(response.body);
+}
+
+async function assertDiscoveryEndpoint(port, routePrefix) {
+  const version = await httpJson(port, `${routePrefix}/json/version`);
+  assert.equal(typeof version.Browser, 'string');
+  assert.equal(typeof version.webSocketDebuggerUrl, 'string');
+  assert.match(version.webSocketDebuggerUrl, /^ws:\/\/127\.0\.0\.1:\d+\/(?:profiles\/[^/]+\/)?devtools\/browser\//);
+  assert.equal(new URL(version.webSocketDebuggerUrl).port, String(port));
+
+  const targets = await httpJson(port, `${routePrefix}/json/list`);
+  assert.ok(Array.isArray(targets), `${routePrefix || 'root'} /json/list should return a target array`);
+  for (const target of targets) {
+    if (target.webSocketDebuggerUrl) {
+      assert.equal(new URL(target.webSocketDebuggerUrl).port, String(port));
+    }
+  }
 }
 
 function encodeClientFrame(payload) {
@@ -613,7 +685,7 @@ async function runLocalSmoke(rawOptions = {}, reporter = console) {
   });
 
   try {
-    const { BridgeManager } = require('../dist/manager.js');
+    const BridgeManager = loadBridgeManager();
     helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort);
     manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
     manager.rootPath = path.join(root, 'bridgewright-state');
@@ -636,6 +708,9 @@ async function runLocalSmoke(rawOptions = {}, reporter = console) {
     await manager.startConnectorPool(new URL(`http://127.0.0.1:${helperPorts.tunnelPort}/bridgewright-tunnel`));
 
     reporter.log(`Bridgewright local smoke endpoint: http://127.0.0.1:${helperPorts.cdpPort}`);
+    await assertDiscoveryEndpoint(helperPorts.cdpPort, '');
+    reporter.log('Root default CDP discovery: ok');
+
     reporter.log(`Opening default profile and navigating to ${pages.defaultFirst.url}`);
     const defaultFirst = await openAndNavigate(helperPorts.cdpPort, '', pages.defaultFirst.url);
     assertPageState(defaultFirst.pageState, {
@@ -653,11 +728,10 @@ async function runLocalSmoke(rawOptions = {}, reporter = console) {
     assert.equal(rejectedDefaultClose.statusCode, 400);
     assert.ok(manager.runtimes.has('default'), 'Default runtime should survive rejected default close');
 
-    await closeBrowserTargets(defaultFirst.browser);
     defaultFirst.browser.close();
-    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after closing page targets');
+    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after root CDP disconnect');
     assert.ok(fs.existsSync(defaultProfilePath), 'Default profile directory should remain after closing default runtime');
-    reporter.log('Default profile navigation, close rejection, and target close: ok');
+    reporter.log('Default profile navigation, close rejection, and disconnect cleanup: ok');
 
     reporter.log(`Reopening default profile and navigating to ${pages.defaultSecond.url}`);
     const defaultSecond = await openAndNavigate(helperPorts.cdpPort, '', pages.defaultSecond.url);
@@ -665,13 +739,14 @@ async function runLocalSmoke(rawOptions = {}, reporter = console) {
       title: pages.defaultSecond.title,
       bodyPattern: /default profile still works after close/,
     });
-    await closeBrowserTargets(defaultSecond.browser);
     defaultSecond.browser.close();
-    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after second close');
+    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after second root CDP disconnect');
     reporter.log('Default profile reopen after close: ok');
 
     reporter.log(`Opening named profile "${options.profile}" and navigating to ${pages.namedFirst.url}`);
     const profilePrefix = `/profiles/${encodeURIComponent(options.profile)}`;
+    await assertDiscoveryEndpoint(helperPorts.cdpPort, profilePrefix);
+    reporter.log(`Named profile "${options.profile}" CDP discovery: ok`);
     const namedFirst = await openAndNavigate(helperPorts.cdpPort, profilePrefix, pages.namedFirst.url);
     assertPageState(namedFirst.pageState, {
       title: pages.namedFirst.expectedTitle,
@@ -738,9 +813,8 @@ async function runLocalSmoke(rawOptions = {}, reporter = console) {
       title: pages.defaultFinal.title,
       bodyPattern: /default profile works after named profile cleanup/,
     });
-    await closeBrowserTargets(defaultFinal.browser);
     defaultFinal.browser.close();
-    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after final close');
+    await waitFor(() => !manager.runtimes.has('default'), 10000, 'Default Edge runtime did not exit after final root CDP disconnect');
     const finalProfiles = await httpJson(helperPorts.cdpPort, '/profiles');
     assert.deepEqual(finalProfiles.profiles, [
       {
@@ -779,6 +853,7 @@ async function main() {
 module.exports = {
   parseArgs,
   runLocalSmoke,
+  runLockedDefaultProfileProbe,
 };
 
 if (require.main === module) {

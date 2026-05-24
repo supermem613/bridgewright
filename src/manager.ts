@@ -64,7 +64,7 @@ class RemoteHelperError extends Error {
 
 const DEFAULT_PROFILE = 'default';
 const PROFILE_NAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}$/;
-const NAMED_PROFILE_DISCONNECT_GRACE_MS = 750;
+const PROFILE_DISCONNECT_GRACE_MS = 750;
 
 function isValidProfileName(name: string): boolean {
   return PROFILE_NAME_RE.test(name);
@@ -529,7 +529,7 @@ function prefixProfilePath(profile, pathValue) {
 }
 
 function rewriteWsUrl(profile, value) {
-  if (profile === 'default' || typeof value !== 'string') return value;
+  if (typeof value !== 'string') return value;
   try {
     const parsed = new URL(value);
     if (!parsed.pathname.startsWith('/profiles/')) {
@@ -543,7 +543,7 @@ function rewriteWsUrl(profile, value) {
 }
 
 function rewriteDevtoolsFrontendUrl(profile, value) {
-  if (profile === 'default' || typeof value !== 'string') return value;
+  if (typeof value !== 'string') return value;
   try {
     const parsed = new URL(value, 'http://127.0.0.1:' + cdpPort);
     for (const key of ['ws', 'wss']) {
@@ -562,7 +562,6 @@ function rewriteDevtoolsFrontendUrl(profile, value) {
 }
 
 function rewriteDiscoveryJson(profile, payload) {
-  if (profile === 'default') return payload;
   const rewriteEntry = entry => {
     if (!entry || typeof entry !== 'object') return entry;
     return {
@@ -642,6 +641,17 @@ function parseHttpResponseHead(buffer) {
   };
 }
 
+function getContentLength(headers) {
+  const entry = Object.entries(headers).find(([name]) => name.toLowerCase() === 'content-length');
+  if (!entry) return Number.NaN;
+  return Number.parseInt(String(entry[1]), 10);
+}
+
+function discoveryResponseCanBeBuffered(parsed) {
+  const expectedBodyLength = getContentLength(parsed.headers);
+  return Number.isFinite(expectedBodyLength) && parsed.body.length >= expectedBodyLength;
+}
+
 async function proxyHttpRequest(request, response) {
   const url = request.url || '/';
   if (new URL(url, 'http://127.0.0.1').pathname === '/bridgewright/check-endpoint.js') {
@@ -702,29 +712,34 @@ async function proxyHttpRequest(request, response) {
       return;
     }
     if (!parsed) return;
-    if (isDiscovery && parsed.statusCode >= 200 && parsed.statusCode < 300 && normalized.profile !== 'default') {
-      const contentLengthEntry = Object.entries(parsed.headers).find(([name]) => name.toLowerCase() === 'content-length');
-      const expectedBodyLength = contentLengthEntry ? Number.parseInt(String(contentLengthEntry[1]), 10) : Number.NaN;
-      if (Number.isFinite(expectedBodyLength) && parsed.body.length < expectedBodyLength) return;
+    if (isDiscovery && parsed.statusCode >= 200 && parsed.statusCode < 300 && Number.isFinite(getContentLength(parsed.headers))) {
+      if (!discoveryResponseCanBeBuffered(parsed)) return;
       try {
-        const json = JSON.parse(parsed.body.toString('utf8'));
-        const rewritten = Buffer.from(JSON.stringify(rewriteDiscoveryJson(normalized.profile, json), null, 2) + '\n');
+        const rewritten = normalized.routePath === '/json/protocol'
+          ? parsed.body
+          : Buffer.from(JSON.stringify(rewriteDiscoveryJson(normalized.profile, JSON.parse(parsed.body.toString('utf8'))), null, 2) + '\n');
         const headers = Object.fromEntries(Object.entries(parsed.headers).filter(([name]) => name.toLowerCase() !== 'content-length'));
         parsed = {
           ...parsed,
           headers: {
             ...headers,
-            'content-type': 'application/json',
+            ...(normalized.routePath === '/json/protocol' ? {} : { 'content-type': 'application/json' }),
             'content-length': rewritten.length,
           },
           body: rewritten
         };
       } catch (error) {
         clearTimeout(timer);
-        sendJson(response, 502, { error: 'Failed to rewrite profile CDP discovery response', detail: error.message });
+        sendJson(response, 502, { error: 'Failed to rewrite CDP discovery response', detail: error.message });
         tunnel.close();
         return;
       }
+      headersWritten = true;
+      clearTimeout(timer);
+      response.writeHead(parsed.statusCode, parsed.statusMessage, parsed.headers);
+      response.end(parsed.body);
+      tunnel.close();
+      return;
     }
     headersWritten = true;
     response.writeHead(parsed.statusCode, parsed.statusMessage, parsed.headers);
@@ -975,12 +990,19 @@ export class BridgeManager implements vscode.Disposable {
     return vscode.workspace.getConfiguration('bridgewright').get<boolean>('closeNamedProfilesOnDisconnect', true);
   }
 
+  private closeDefaultProfileOnDisconnect(): boolean {
+    return vscode.workspace.getConfiguration('bridgewright').get<boolean>('closeDefaultProfileOnDisconnect', true);
+  }
+
   private readProfilePath(): string {
     const configured = vscode.workspace.getConfiguration('bridgewright').get<string>('edgeUserDataDir', '').trim();
     if (configured.length > 0) {
       return configured;
     }
-    return path.join(os.homedir(), 'AppData\\Local\\Microsoft\\Edge\\User Data');
+    if (vscode.workspace.getConfiguration('bridgewright').get<boolean>('useSystemEdgeUserDataDirByDefault', false)) {
+      return path.join(os.homedir(), 'AppData\\Local\\Microsoft\\Edge\\User Data');
+    }
+    return path.join(os.homedir(), '.bridgewright', 'default-edge-user-data');
   }
 
   private async ensureStorage(): Promise<void> {
@@ -1464,14 +1486,15 @@ export class BridgeManager implements vscode.Disposable {
   private async runConnectorLoop(tunnelUri: URL, signal: AbortSignal, connectorId: number, onArmed: () => void): Promise<void> {
     while (!signal.aborted) {
       let pairedRuntime: EdgeRuntime | undefined;
+      let tunnel: BridgeWebSocket | undefined;
+      let edge: net.Socket | undefined;
       try {
         this.log(`Connector ${connectorId} connecting to tunnel ${tunnelUri.toString()}`);
-        const tunnel = await this.connectWebSocketTunnel(tunnelUri, signal);
+        tunnel = await this.connectWebSocketTunnel(tunnelUri, signal);
         this.log(`Connector ${connectorId} armed`);
         onArmed();
         const pendingPayloads: Buffer[] = [];
         let firstPayloadResolver: (() => void) | undefined;
-        let edge: net.Socket | undefined;
         tunnel.onData(chunk => {
           if (edge && !edge.destroyed) {
             edge.write(chunk);
@@ -1501,6 +1524,7 @@ export class BridgeManager implements vscode.Disposable {
         this.retainRuntimeSession(runtime);
         pairedRuntime = runtime;
         edge = await this.connectSocket(runtime.port, signal);
+        const activeTunnel = tunnel;
         this.state = {
           ...this.state,
           browser: runtime.cdp.Browser,
@@ -1510,7 +1534,7 @@ export class BridgeManager implements vscode.Disposable {
         };
         await this.writeState(this.state);
         this.log(`Connector ${connectorId} paired ${tunnelUri.toString()} to local Edge ${runtime.port} profile=${routed.profile}`);
-        edge.on('data', chunk => tunnel.send(Buffer.from(chunk)));
+        edge.on('data', chunk => activeTunnel.send(Buffer.from(chunk)));
         edge.once('error', error => {
           this.log(`Connector ${connectorId} Edge socket closed with error: ${this.errorMessage(error)}`);
         });
@@ -1527,6 +1551,11 @@ export class BridgeManager implements vscode.Disposable {
       } catch (error) {
         if (!signal.aborted) {
           this.log(`Connector ${connectorId} retry: ${this.errorMessage(error)}`);
+          if (tunnel) {
+            tunnel.send(httpJsonResponse(503, { error: this.errorMessage(error) }));
+            tunnel.close();
+          }
+          edge?.destroy();
           await this.waitForAbortOrTimeout(signal, 500);
         }
       } finally {
@@ -1543,15 +1572,32 @@ export class BridgeManager implements vscode.Disposable {
 
   private async releaseRuntimeSession(runtime: EdgeRuntime, connectorId: number): Promise<void> {
     runtime.activeSessions = Math.max(0, runtime.activeSessions - 1);
-    if (runtime.profile === DEFAULT_PROFILE || !this.closeNamedProfilesOnDisconnect()) {
+    const isDefaultProfile = runtime.profile === DEFAULT_PROFILE;
+    const shouldCloseOnDisconnect = isDefaultProfile
+      ? this.closeDefaultProfileOnDisconnect()
+      : this.closeNamedProfilesOnDisconnect();
+    if (!shouldCloseOnDisconnect) {
       return;
     }
     if (runtime.activeSessions > 0 || this.runtimes.get(runtime.profile) !== runtime) {
       return;
     }
 
-    await this.delay(NAMED_PROFILE_DISCONNECT_GRACE_MS);
+    await this.delay(PROFILE_DISCONNECT_GRACE_MS);
     if (runtime.activeSessions > 0 || this.runtimes.get(runtime.profile) !== runtime) {
+      return;
+    }
+
+    if (isDefaultProfile) {
+      this.log(`Connector ${connectorId} closed last session for default profile; stopping Edge runtime`);
+      await this.stopRuntime(runtime);
+      if (this.runtimes.get(runtime.profile) === runtime) {
+        this.runtimes.delete(runtime.profile);
+      }
+      if (this.edgeProcess === runtime.process) {
+        this.edgeProcess = undefined;
+        this.edgeCdp = undefined;
+      }
       return;
     }
 
@@ -1710,6 +1756,7 @@ export class BridgeManager implements vscode.Disposable {
 
     if (profile === DEFAULT_PROFILE) {
       this.edgeLaunch = launch.then(runtime => runtime.cdp);
+      this.edgeLaunch.catch(() => undefined);
     } else {
       this.namedProfileLaunches.set(profile, launch);
     }

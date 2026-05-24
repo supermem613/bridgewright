@@ -73,7 +73,12 @@
         "bridgewright.edgeUserDataDir": {
           "type": "string",
           "default": "",
-          "description": "Windows Edge user data directory to use for Bridgewright. Leave empty to use the permanent Edge profile root at %LOCALAPPDATA%\\Microsoft\\Edge\\User Data."
+          "description": "Windows Edge user data directory to use for Bridgewright's default profile. Leave empty to use Bridgewright's dedicated durable automation profile."
+        },
+        "bridgewright.useSystemEdgeUserDataDirByDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "Compatibility switch. When edgeUserDataDir is empty, use the permanent Edge profile root at %LOCALAPPDATA%\\Microsoft\\Edge\\User Data instead of Bridgewright's dedicated default automation profile."
         },
         "bridgewright.connectorPoolSize": {
           "type": "number",
@@ -86,6 +91,11 @@
           "type": "boolean",
           "default": true,
           "description": "Close and remove non-default profile browser state when the final profile-scoped CDP connection disconnects. Disable to keep named profile windows alive until /profiles/<name>/close or /remove is called."
+        },
+        "bridgewright.closeDefaultProfileOnDisconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close the default profile browser window when the final root CDP connection disconnects. The default profile data remains durable."
         }
       }
     }
