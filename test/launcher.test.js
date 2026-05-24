@@ -12,7 +12,7 @@ test('remote shell quote preserves shell-sensitive path characters', () => {
 
 test('remote launcher script invokes helper with stable argv and diagnostics', () => {
   const script = createRemoteLauncherScript({
-    helperPath: '/workspaces/O\'Brien/.bridgewright-runtime/bridgewright-helper.js',
+    helperPath: '/workspaces/O\'Brien/.bridgewright-runtime/bridgewright-helper.cjs',
     readyPath: '/workspaces/O\'Brien/.bridgewright-runtime/ready-1.json',
     logPath: '/workspaces/O\'Brien/.bridgewright-runtime/helper-1.log',
     cdpPort: 37373,

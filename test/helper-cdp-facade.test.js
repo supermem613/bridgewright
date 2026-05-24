@@ -44,12 +44,15 @@ async function startHelper(options = {}) {
     : await reservePortPair();
   const { cdpPort, tunnelPort } = ports;
   const root = options.root || fs.mkdtempSync(path.join(os.tmpdir(), 'bridgewright-helper-test-'));
-  const helperPath = path.join(root, 'bridgewright-helper.js');
+  const helperPath = path.join(root, 'bridgewright-helper.cjs');
   const checkerPath = path.join(root, 'bridgewright-check-endpoint.js');
   const readyPath = path.join(root, 'ready.json');
   const logPath = path.join(root, 'helper.log');
   fs.writeFileSync(helperPath, extractHelperScript(), 'utf8');
   fs.writeFileSync(checkerPath, 'console.log("bridgewright checker");\n', 'utf8');
+  if (options.packageTypeModule) {
+    fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}\n', 'utf8');
+  }
 
   const args = [
     helperPath,
@@ -280,6 +283,14 @@ test('helper parses boolean replace flag before valued arguments', async () => {
   }, { replaceExistingFirst: true });
 });
 
+test('helper runs as CommonJS inside type module workspaces', async () => {
+  await withHelper(async helper => {
+    const ready = JSON.parse(fs.readFileSync(helper.readyPath, 'utf8'));
+    assert.equal(ready.status, 'running');
+    assert.equal(ready.cdpPort, helper.cdpPort);
+  }, { packageTypeModule: true });
+});
+
 test('/json/version proxies through tunnel and closes response', async () => {
   await withHelper(async helper => {
     const tunnel = await connectTunnel(helper.tunnelPort);
@@ -316,6 +327,59 @@ test('/json and /json/list proxy discovery endpoints', async () => {
       assert.equal(response.statusCode, 200);
       assert.equal(JSON.parse(response.body)[0].id, 'page-1');
     }
+  });
+});
+
+test('profiled discovery forwards facade URL and rewrites websocket URL', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const pending = httpGet(helper.cdpPort, '/profiles/kash-work/json/version');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/profiles\/kash-work\/json\/version HTTP\/1\.1/m);
+    const body = JSON.stringify({ Browser: 'BridgewrightTest', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/test' });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    assert.equal(JSON.parse(response.body).webSocketDebuggerUrl, `ws://127.0.0.1:${helper.cdpPort}/profiles/kash-work/devtools/browser/test`);
+  });
+});
+
+test('profiled target list rewrites devtools frontend websocket parameters', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const pending = httpGet(helper.cdpPort, '/profiles/kash_work/json/list');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/profiles\/kash_work\/json\/list HTTP\/1\.1/m);
+    const body = JSON.stringify([{
+      id: 'page-1',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/page-1',
+      devtoolsFrontendUrl: '/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/page-1',
+      devtoolsFrontendUrlCompat: '/devtools/js_app.html?wss=127.0.0.1:9222/devtools/page/page-1',
+    }]);
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    const [target] = JSON.parse(response.body);
+    assert.equal(target.webSocketDebuggerUrl, `ws://127.0.0.1:${helper.cdpPort}/profiles/kash_work/devtools/page/page-1`);
+    assert.equal(target.devtoolsFrontendUrl, `/devtools/inspector.html?ws=127.0.0.1%3A${helper.cdpPort}%2Fprofiles%2Fkash_work%2Fdevtools%2Fpage%2Fpage-1`);
+    assert.equal(target.devtoolsFrontendUrlCompat, `/devtools/js_app.html?wss=127.0.0.1%3A${helper.cdpPort}%2Fprofiles%2Fkash_work%2Fdevtools%2Fpage%2Fpage-1`);
+  });
+});
+
+test('profiled json protocol is routed without discovery websocket rewriting', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const pending = httpGet(helper.cdpPort, '/profiles/protocol-1/json/protocol');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/profiles\/protocol-1\/json\/protocol HTTP\/1\.1/m);
+    const body = JSON.stringify({ version: { major: '1', minor: '3' }, domains: [] });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(JSON.parse(response.body), { version: { major: '1', minor: '3' }, domains: [] });
   });
 });
 
@@ -373,6 +437,26 @@ test('unsupported discovery path returns fast 404 JSON', async () => {
     const response = await httpGet(helper.cdpPort, '/not-cdp');
     assert.equal(response.statusCode, 404);
     assert.equal(JSON.parse(response.body).error, 'Unsupported CDP discovery path');
+  });
+});
+
+test('invalid profiled discovery names are rejected without consuming a tunnel', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    for (const pathName of ['/profiles/%2e%2e/json/version', '/profiles/bad%2Fname/json/version', '/profiles/-bad/json/version']) {
+      const response = await httpGet(helper.cdpPort, pathName);
+      assert.equal(response.statusCode, 400);
+      assert.equal(JSON.parse(response.body).error, 'Invalid Bridgewright profile name');
+    }
+
+    const pending = httpGet(helper.cdpPort, '/json/version');
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/json\/version HTTP\/1\.1/m);
+    const body = JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${helper.cdpPort}/devtools/browser/test` });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
   });
 });
 
@@ -488,6 +572,59 @@ test('/devtools websocket upgrade proxies through tunnel', async () => {
     tunnel.send('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
     tunnel.close();
     assert.equal(await upgrade, 101);
+  });
+});
+
+test('profiled devtools websocket upgrade proxies through tunnel with profile path', async () => {
+  await withHelper(async helper => {
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const upgrade = new Promise((resolve, reject) => {
+      const key = crypto.randomBytes(16).toString('base64');
+      const request = http.request({
+        host: '127.0.0.1',
+        port: helper.cdpPort,
+        path: '/profiles/kash-work/devtools/browser/test',
+        headers: {
+          Connection: 'Upgrade',
+          Upgrade: 'websocket',
+          'Sec-WebSocket-Version': '13',
+          'Sec-WebSocket-Key': key,
+        },
+      });
+      request.once('upgrade', (response, socket) => {
+        socket.destroy();
+        resolve(response.statusCode);
+      });
+      request.once('error', reject);
+      request.end();
+    });
+
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/profiles\/kash-work\/devtools\/browser\/test HTTP\/1\.1/m);
+    tunnel.send('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    tunnel.close();
+    assert.equal(await upgrade, 101);
+  });
+});
+
+test('profile management routes proxy through tunnel', async () => {
+  await withHelper(async helper => {
+    for (const [method, requestPath] of [
+      ['GET', '/profiles'],
+      ['POST', '/profiles/kash-work/close'],
+      ['POST', '/profiles/kash-work/remove'],
+      ['POST', '/profiles/default/remove'],
+    ]) {
+      const tunnel = await connectTunnel(helper.tunnelPort);
+      const pending = httpRequest(helper.cdpPort, requestPath, method);
+      const request = (await tunnel.nextFrame()).toString('utf8');
+      assert.match(request, new RegExp(`^${method} ${requestPath.replaceAll('/', '\\/')} HTTP\\/1\\.1`, 'm'));
+      const body = JSON.stringify({ ok: true });
+      tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      tunnel.close();
+      const response = await pending;
+      assert.equal(response.statusCode, 200);
+    }
   });
 });
 
