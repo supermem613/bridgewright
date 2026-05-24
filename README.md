@@ -18,7 +18,7 @@ Named CDP profiles are available by adding a profile path to the endpoint:
 await chromium.connectOverCDP("http://127.0.0.1:37373/profiles/kash-work");
 ```
 
-`default` uses the durable Edge user data directory. Any other valid profile name is session-scoped, stored under `~\.bridgewright\profiles\<name>\edge-user-data`, and removed when Bridgewright starts, stops, or receives a profile close/remove request.
+`default` uses the durable Edge user data directory. Any other valid profile name is session-scoped, stored under `~\.bridgewright\profiles\<name>\edge-user-data`, and removed when Bridgewright starts, stops, receives a profile close/remove request, or the final profile-scoped CDP connection disconnects.
 
 ## Quickstart
 
@@ -61,6 +61,20 @@ curl -fsSL http://127.0.0.1:37373/bridgewright/check-endpoint.js | node - --diag
 
 `--diagnose` is repo-independent. If Playwright is not installed in the current repo, the checker still returns `ok: true` when HTTP/CDP health is green and marks the Playwright snapshot as skipped. Use `--playwright` when Playwright attach must be a required gate.
 
+The repo test suite also includes a local browser/profile e2e that does not require installing the extension in VS Code:
+
+```powershell
+npm test
+```
+
+To run only that e2e:
+
+```powershell
+npm run e2e:local
+```
+
+The local e2e starts the embedded helper on random localhost ports, drives the real Bridgewright connector code, verifies default-profile navigation and close behavior, rejects default profile close through the management API, verifies default can reopen, verifies named profiles navigate independently, verifies final CDP disconnect cleanup, verifies one client disconnect does not close a profile while another client remains connected, verifies `remove` stops and deletes named profiles, and finally verifies default still works after named-profile cleanup. This does not cover VS Code activation, status bar commands, or `vscode.env.asExternalUri`.
+
 ## Commands
 
 - `Bridgewright: Start Local Browser Bridge`
@@ -81,19 +95,19 @@ Windows-side Bridgewright files are stored under:
 
 Only non-default profiles live under `~\.bridgewright\profiles`. Bridgewright deletes that directory on every start and stop so disposable Codespaces cannot leave host-side browser data behind forever. The default Edge profile path is never deleted by Bridgewright.
 
-Codespace-side files are written to:
+Codespace-side status files are written to:
 
 ```text
 ~/.bridgewright/endpoint.json
 ~/.bridgewright/status.json
 ```
 
-Per-run helper files are written inside the active workspace:
+Per-run helper files are written under the remote user home and cleaned on Bridgewright start and stop:
 
 ```text
-.bridgewright-runtime/launch-<run>.sh
-.bridgewright-runtime/helper-<run>.log
-.bridgewright-runtime/ready-<run>.json
+~/.bridgewright/runtime/launch-<run>.sh
+~/.bridgewright/runtime/helper-<run>.log
+~/.bridgewright/runtime/ready-<run>.json
 ```
 
 ## Requirements
@@ -111,7 +125,7 @@ Per-run helper files are written inside the active workspace:
 
 ## Troubleshooting
 
-Open **Bridgewright: Show Logs** first. If startup fails before the status bar reaches running, inspect the latest `.bridgewright-runtime/helper-<run>.log` in the Codespace workspace. A healthy helper log includes `BRIDGEWRIGHT_READY`.
+Open **Bridgewright: Show Logs** first. If startup fails before the status bar reaches running, inspect the latest `~/.bridgewright/runtime/helper-<run>.log` in the Codespace. A healthy helper log includes `BRIDGEWRIGHT_READY`.
 
 If the helper is ready but Playwright cannot connect, run:
 
@@ -131,13 +145,13 @@ curl -X POST http://127.0.0.1:37373/profiles/kash-work/close
 curl -X POST http://127.0.0.1:37373/profiles/kash-work/remove
 ```
 
-Profile names must match `[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}`. `close` and `remove` are idempotent for named profiles and reject `default`.
+Profile names must match `[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}`. `close` and `remove` are idempotent for named profiles and reject `default`. Named profiles also close automatically after the last profile-scoped CDP connection disconnects. Set `bridgewright.closeNamedProfilesOnDisconnect` to `false` to keep named profiles alive until an explicit close or remove request.
 
 ## How it works
 
 Bridgewright starts a small helper inside the Codespace that listens on `127.0.0.1:37373`. Start arms the bridge. Your Playwright code connects to that endpoint, and the first CDP bytes trigger local Edge startup. The local VS Code extension connects back through VS Code-forwarded WebSocket tunnels and pipes CDP bytes to Edge.
 
-By default Bridgewright uses the permanent Edge user data root at `%LOCALAPPDATA%\Microsoft\Edge\User Data`. Override `bridgewright.edgeUserDataDir` if you want a dedicated durable default automation profile instead. Named profiles always use Bridgewright-owned ephemeral storage and are cleaned on Bridgewright start and stop.
+By default Bridgewright uses the permanent Edge user data root at `%LOCALAPPDATA%\Microsoft\Edge\User Data`. Override `bridgewright.edgeUserDataDir` if you want a dedicated durable default automation profile instead. Named profiles always use Bridgewright-owned ephemeral storage and are cleaned on Bridgewright start, stop, explicit close/remove, or final CDP disconnect.
 
 If the Edge window is closed, Bridgewright closes that CDP socket, keeps the status bar bridge running, and waits for the next incoming connection.
 

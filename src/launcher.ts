@@ -12,6 +12,19 @@ export function remoteShellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+export function resolveRemoteRuntimePath(workspacePath: string): string {
+  const normalized = workspacePath.replace(/\/+$/, '') || '/';
+  const unixHome = /^\/home\/[^/]+(?:\/|$)/.exec(normalized);
+  if (unixHome) {
+    return `${unixHome[0].replace(/\/$/, '')}/.bridgewright/runtime`;
+  }
+  const macHome = /^\/Users\/[^/]+(?:\/|$)/.exec(normalized);
+  if (macHome) {
+    return `${macHome[0].replace(/\/$/, '')}/.bridgewright/runtime`;
+  }
+  return '/home/vscode/.bridgewright/runtime';
+}
+
 export function createRemoteLauncherScript(options: RemoteLauncherOptions): string {
   const helperPath = remoteShellQuote(options.helperPath);
   const readyPath = remoteShellQuote(options.readyPath);

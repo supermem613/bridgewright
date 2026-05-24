@@ -7,7 +7,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createRemoteLauncherScript, remoteShellQuote } from './launcher';
+import { createRemoteLauncherScript, remoteShellQuote, resolveRemoteRuntimePath } from './launcher';
 import { encodeMaskedWebSocketFrame } from './websocket';
 
 type BridgeStatus = 'stopped' | 'starting' | 'running' | 'error';
@@ -35,6 +35,7 @@ interface EdgeRuntime {
   readonly profilePath: string;
   readonly process: childProcess.ChildProcess;
   readonly cdp: CdpVersion;
+  activeSessions: number;
 }
 
 interface RoutedPayload {
@@ -63,6 +64,7 @@ class RemoteHelperError extends Error {
 
 const DEFAULT_PROFILE = 'default';
 const PROFILE_NAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}$/;
+const NAMED_PROFILE_DISCONNECT_GRACE_MS = 750;
 
 function isValidProfileName(name: string): boolean {
   return PROFILE_NAME_RE.test(name);
@@ -178,7 +180,7 @@ const discoveryTimeoutMs = Number.parseInt(args.get('--discovery-timeout-ms') ||
 const replaceExisting = args.has('--replace-existing');
 const readyFile = args.get('--ready-file');
 const runtimeLog = args.get('--runtime-log');
-const root = path.join(os.homedir(), '.bridgewright');
+const root = args.get('--root') || path.join(os.homedir(), '.bridgewright');
 const logs = path.join(root, 'logs');
 const checkerScriptFile = path.join(path.dirname(path.resolve(process.argv[1])), 'bridgewright-check-endpoint.js');
 fs.mkdirSync(logs, { recursive: true });
@@ -829,8 +831,11 @@ export class BridgeManager implements vscode.Disposable {
   private edgeProcess: childProcess.ChildProcess | undefined;
   private edgeCdp: CdpVersion | undefined;
   private edgeLaunch: Promise<CdpVersion> | undefined;
+  private readonly namedProfileLaunches = new Map<string, Promise<EdgeRuntime>>();
+  private readonly namedProfileCleanups = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, EdgeRuntime>();
   private helperTerminal: vscode.Terminal | undefined;
+  private remoteRuntimeDir: vscode.Uri | undefined;
   private connectorAbort: AbortController | undefined;
   private logStream: fs.WriteStream | undefined;
   private status: BridgeStatus = 'stopped';
@@ -901,7 +906,7 @@ export class BridgeManager implements vscode.Disposable {
       this.setStatus('running');
       vscode.window.showInformationMessage(`Bridgewright running at ${endpoint}`);
     } catch (error) {
-      await this.stopProcesses();
+      await this.stopProcesses(false);
       const message = this.errorMessage(error);
       this.log(`Start failed: ${message}`);
       this.state = this.createState('error', message);
@@ -966,6 +971,10 @@ export class BridgeManager implements vscode.Disposable {
     return vscode.workspace.getConfiguration('bridgewright').get<number>('connectorPoolSize', 4);
   }
 
+  private closeNamedProfilesOnDisconnect(): boolean {
+    return vscode.workspace.getConfiguration('bridgewright').get<boolean>('closeNamedProfilesOnDisconnect', true);
+  }
+
   private readProfilePath(): string {
     const configured = vscode.workspace.getConfiguration('bridgewright').get<string>('edgeUserDataDir', '').trim();
     if (configured.length > 0) {
@@ -1002,7 +1011,18 @@ export class BridgeManager implements vscode.Disposable {
     if (!isValidProfileName(profile)) {
       throw new Error(`Invalid Bridgewright profile name: ${profile}`);
     }
-    await fs.promises.rm(path.join(this.namedProfilesPath, profile), { recursive: true, force: true });
+    const profilePath = path.join(this.namedProfilesPath, profile);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await fs.promises.rm(profilePath, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        lastError = error;
+        await this.delay(200);
+      }
+    }
+    throw lastError;
   }
 
   private async stopRuntime(runtime: EdgeRuntime): Promise<void> {
@@ -1022,12 +1042,28 @@ export class BridgeManager implements vscode.Disposable {
     if (profile === DEFAULT_PROFILE) {
       throw new Error('The default Bridgewright profile cannot be removed.');
     }
-    const runtime = this.runtimes.get(profile);
-    if (runtime) {
-      this.runtimes.delete(profile);
-      await this.stopRuntime(runtime);
+    const existingCleanup = this.namedProfileCleanups.get(profile);
+    if (existingCleanup) {
+      await existingCleanup;
+      return;
     }
-    await this.deleteNamedProfile(profile);
+    const cleanup = (async () => {
+      const runtime = this.runtimes.get(profile);
+      if (runtime) {
+        runtime.activeSessions = 0;
+        this.runtimes.delete(profile);
+        await this.stopRuntime(runtime);
+      }
+      await this.deleteNamedProfile(profile);
+    })();
+    this.namedProfileCleanups.set(profile, cleanup);
+    try {
+      await cleanup;
+    } finally {
+      if (this.namedProfileCleanups.get(profile) === cleanup) {
+        this.namedProfileCleanups.delete(profile);
+      }
+    }
   }
 
   private async listProfiles(): Promise<Array<{ profile: string; running: boolean; durable: boolean }>> {
@@ -1346,7 +1382,12 @@ export class BridgeManager implements vscode.Disposable {
   }
 
   private async startRemoteHelper(workspaceFolder: vscode.WorkspaceFolder, port: number, tunnelPort: number): Promise<RemoteHelper> {
-    const runtimeDir = vscode.Uri.joinPath(workspaceFolder.uri, '.bridgewright-runtime');
+    const runtimeDir = workspaceFolder.uri.with({
+      path: resolveRemoteRuntimePath(workspaceFolder.uri.path),
+    });
+    this.remoteRuntimeDir = runtimeDir;
+    await this.deleteRemoteDirectoryIfExists(vscode.Uri.joinPath(workspaceFolder.uri, '.bridgewright-runtime'));
+    await this.deleteRemoteDirectoryIfExists(runtimeDir);
     const helperUri = vscode.Uri.joinPath(runtimeDir, 'bridgewright-helper.cjs');
     const checkerUri = vscode.Uri.joinPath(runtimeDir, 'bridgewright-check-endpoint.js');
     const runId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1422,6 +1463,7 @@ export class BridgeManager implements vscode.Disposable {
 
   private async runConnectorLoop(tunnelUri: URL, signal: AbortSignal, connectorId: number, onArmed: () => void): Promise<void> {
     while (!signal.aborted) {
+      let pairedRuntime: EdgeRuntime | undefined;
       try {
         this.log(`Connector ${connectorId} connecting to tunnel ${tunnelUri.toString()}`);
         const tunnel = await this.connectWebSocketTunnel(tunnelUri, signal);
@@ -1456,6 +1498,8 @@ export class BridgeManager implements vscode.Disposable {
         }
         pendingPayloads[0] = routed.payload;
         const runtime = await this.ensureEdgeStarted(routed.profile);
+        this.retainRuntimeSession(runtime);
+        pairedRuntime = runtime;
         edge = await this.connectSocket(runtime.port, signal);
         this.state = {
           ...this.state,
@@ -1467,6 +1511,9 @@ export class BridgeManager implements vscode.Disposable {
         await this.writeState(this.state);
         this.log(`Connector ${connectorId} paired ${tunnelUri.toString()} to local Edge ${runtime.port} profile=${routed.profile}`);
         edge.on('data', chunk => tunnel.send(Buffer.from(chunk)));
+        edge.once('error', error => {
+          this.log(`Connector ${connectorId} Edge socket closed with error: ${this.errorMessage(error)}`);
+        });
         for (const payload of pendingPayloads.splice(0)) {
           edge.write(payload);
         }
@@ -1482,6 +1529,44 @@ export class BridgeManager implements vscode.Disposable {
           this.log(`Connector ${connectorId} retry: ${this.errorMessage(error)}`);
           await this.waitForAbortOrTimeout(signal, 500);
         }
+      } finally {
+        if (pairedRuntime) {
+          await this.releaseRuntimeSession(pairedRuntime, connectorId);
+        }
+      }
+    }
+  }
+
+  private retainRuntimeSession(runtime: EdgeRuntime): void {
+    runtime.activeSessions += 1;
+  }
+
+  private async releaseRuntimeSession(runtime: EdgeRuntime, connectorId: number): Promise<void> {
+    runtime.activeSessions = Math.max(0, runtime.activeSessions - 1);
+    if (runtime.profile === DEFAULT_PROFILE || !this.closeNamedProfilesOnDisconnect()) {
+      return;
+    }
+    if (runtime.activeSessions > 0 || this.runtimes.get(runtime.profile) !== runtime) {
+      return;
+    }
+
+    await this.delay(NAMED_PROFILE_DISCONNECT_GRACE_MS);
+    if (runtime.activeSessions > 0 || this.runtimes.get(runtime.profile) !== runtime) {
+      return;
+    }
+
+    this.runtimes.delete(runtime.profile);
+    this.log(`Connector ${connectorId} closed last session for profile=${runtime.profile}; stopping named Edge runtime`);
+    const cleanup = (async () => {
+      await this.stopRuntime(runtime);
+      await this.deleteNamedProfile(runtime.profile);
+    })();
+    this.namedProfileCleanups.set(runtime.profile, cleanup);
+    try {
+      await cleanup;
+    } finally {
+      if (this.namedProfileCleanups.get(runtime.profile) === cleanup) {
+        this.namedProfileCleanups.delete(runtime.profile);
       }
     }
   }
@@ -1557,9 +1642,21 @@ export class BridgeManager implements vscode.Disposable {
   }
 
   private async ensureEdgeStarted(profile: string): Promise<EdgeRuntime> {
+    const cleanup = this.namedProfileCleanups.get(profile);
+    if (cleanup) {
+      await cleanup;
+    }
+
     const existing = this.runtimes.get(profile);
     if (existing) {
       return existing;
+    }
+
+    if (profile !== DEFAULT_PROFILE) {
+      const pendingLaunch = this.namedProfileLaunches.get(profile);
+      if (pendingLaunch) {
+        return pendingLaunch;
+      }
     }
 
     if (profile === DEFAULT_PROFILE && this.edgeLaunch) {
@@ -1580,6 +1677,7 @@ export class BridgeManager implements vscode.Disposable {
         profilePath,
         cdp: launched.cdp,
         process: launched.process,
+        activeSessions: 0,
       };
       launched.process.once('exit', () => {
         if (this.runtimes.get(profile)?.process === launched.process) {
@@ -1612,12 +1710,16 @@ export class BridgeManager implements vscode.Disposable {
 
     if (profile === DEFAULT_PROFILE) {
       this.edgeLaunch = launch.then(runtime => runtime.cdp);
+    } else {
+      this.namedProfileLaunches.set(profile, launch);
     }
     try {
       return await launch;
     } finally {
       if (profile === DEFAULT_PROFILE) {
         this.edgeLaunch = undefined;
+      } else if (this.namedProfileLaunches.get(profile) === launch) {
+        this.namedProfileLaunches.delete(profile);
       }
     }
   }
@@ -1710,11 +1812,13 @@ export class BridgeManager implements vscode.Disposable {
     });
   }
 
-  private async stopProcesses(): Promise<void> {
+  private async stopProcesses(cleanRemoteRuntime = true): Promise<void> {
     this.connectorAbort?.abort();
     this.connectorAbort = undefined;
     this.helperTerminal?.dispose();
     this.helperTerminal = undefined;
+    const remoteRuntimeDir = this.remoteRuntimeDir;
+    this.remoteRuntimeDir = undefined;
 
     const runtimes = [...this.runtimes.values()];
     this.runtimes.clear();
@@ -1728,6 +1832,20 @@ export class BridgeManager implements vscode.Disposable {
     }
 
     await this.cleanupNamedProfiles();
+    if (cleanRemoteRuntime && remoteRuntimeDir) {
+      await this.deleteRemoteDirectoryIfExists(remoteRuntimeDir);
+    }
+  }
+
+  private async deleteRemoteDirectoryIfExists(uri: vscode.Uri): Promise<void> {
+    try {
+      await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: false });
+    } catch (error) {
+      if (this.isMissingRemoteEntry(error)) {
+        return;
+      }
+      throw error;
+    }
   }
 
   private async writeState(state: BridgeState): Promise<void> {
@@ -1777,6 +1895,11 @@ export class BridgeManager implements vscode.Disposable {
 
   private remoteTerminalPath(uri: vscode.Uri): string {
     return uri.path;
+  }
+
+  private isMissingRemoteEntry(error: unknown): boolean {
+    const message = this.errorMessage(error);
+    return /FileNotFound|EntryNotFound|ENOENT|not found|nonexistent|does not exist/i.test(message);
   }
 
   private delay(ms: number): Promise<void> {

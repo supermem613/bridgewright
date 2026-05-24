@@ -81,6 +81,11 @@
           "minimum": 1,
           "maximum": 16,
           "description": "Number of idle local tunnel connectors Bridgewright keeps ready for incoming Codespace CDP connections."
+        },
+        "bridgewright.closeNamedProfilesOnDisconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close and remove non-default profile browser state when the final profile-scoped CDP connection disconnects. Disable to keep named profile windows alive until /profiles/<name>/close or /remove is called."
         }
       }
     }
@@ -89,7 +94,9 @@
     "build": "tsc -p .",
     "check": "npm run test",
     "lint": "tsc -p . --noEmit",
-    "test": "npm run build && node --test test/*.test.js"
+    "test": "npm run build && node --test test/*.test.js",
+    "e2e:local": "npm run build && node --test test/local-smoke.test.js",
+    "smoke:local": "npm run e2e:local"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",
