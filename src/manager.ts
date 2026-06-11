@@ -33,7 +33,7 @@ interface EdgeRuntime {
   readonly profile: string;
   readonly port: number;
   readonly profilePath: string;
-  readonly process: childProcess.ChildProcess;
+  readonly process?: childProcess.ChildProcess;
   readonly cdp: CdpVersion;
   activeSessions: number;
 }
@@ -884,7 +884,7 @@ export class BridgeManager implements vscode.Disposable {
     this.openLog();
     this.output.show(true);
     this.setStatus('starting');
-    this.log('Starting Bridgewright bridge');
+    this.log(`Starting Bridgewright bridge v${this.readExtensionVersion()}`);
 
     try {
       if (os.platform() !== 'win32') {
@@ -994,6 +994,11 @@ export class BridgeManager implements vscode.Disposable {
     return vscode.workspace.getConfiguration('bridgewright').get<boolean>('closeDefaultProfileOnDisconnect', true);
   }
 
+  private readExtensionVersion(): string {
+    const version = this.context.extension?.packageJSON?.version;
+    return typeof version === 'string' && version.length > 0 ? version : 'unknown';
+  }
+
   private readProfilePath(): string {
     const configured = vscode.workspace.getConfiguration('bridgewright').get<string>('edgeUserDataDir', '').trim();
     if (configured.length > 0) {
@@ -1048,14 +1053,18 @@ export class BridgeManager implements vscode.Disposable {
   }
 
   private async stopRuntime(runtime: EdgeRuntime): Promise<void> {
-    if (runtime.process.exitCode !== null || runtime.process.signalCode !== null) {
+    const runtimeProcess = runtime.process;
+    if (!runtimeProcess) {
       return;
     }
-    if (!runtime.process.killed) {
-      runtime.process.kill();
+    if (runtimeProcess.exitCode !== null || runtimeProcess.signalCode !== null) {
+      return;
+    }
+    if (!runtimeProcess.killed) {
+      runtimeProcess.kill();
     }
     await Promise.race([
-      new Promise<void>(resolve => runtime.process.once('exit', () => resolve())),
+      new Promise<void>(resolve => runtimeProcess.once('exit', () => resolve())),
       this.delay(2_000),
     ]);
   }
@@ -1179,7 +1188,7 @@ export class BridgeManager implements vscode.Disposable {
   }
 
   private assertProfileAvailable(profilePath: string): void {
-    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket']
+    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'lockfile']
       .map(name => path.join(profilePath, name))
       .filter(candidate => fs.existsSync(candidate));
 
@@ -1328,8 +1337,24 @@ export class BridgeManager implements vscode.Disposable {
     };
   }
 
-  private async launchEdge(edgePath: string, profilePath: string): Promise<{ cdp: CdpVersion; port: number; process: childProcess.ChildProcess }> {
+  private async launchEdge(edgePath: string, profilePath: string): Promise<{ cdp: CdpVersion; port: number; process?: childProcess.ChildProcess }> {
     await fs.promises.mkdir(profilePath, { recursive: true });
+    const existingPort = await this.tryReadDevToolsActivePort(profilePath);
+    if (existingPort !== undefined) {
+      const cdp = await this.tryGetLocalCdp(existingPort);
+      if (cdp) {
+        this.log(`Reusing existing Bridgewright Edge on local CDP port ${existingPort}`);
+        return { cdp, port: existingPort };
+      }
+      this.log(`Ignoring stale DevToolsActivePort value ${existingPort}`);
+    }
+
+    const recovered = await this.tryRecoverExistingEdgeCdp(profilePath);
+    if (recovered) {
+      return recovered;
+    }
+
+    this.assertProfileAvailable(profilePath);
     await fs.promises.rm(path.join(profilePath, 'DevToolsActivePort'), { force: true });
     const args = [
       '--remote-debugging-port=0',
@@ -1353,6 +1378,84 @@ export class BridgeManager implements vscode.Disposable {
     const port = await this.waitForDevToolsActivePort(profilePath, edgeProcess);
     const cdp = await this.waitForLocalCdp(port);
     return { cdp, port, process: edgeProcess };
+  }
+
+  private async tryRecoverExistingEdgeCdp(profilePath: string): Promise<{ cdp: CdpVersion; port: number } | undefined> {
+    const ports = await this.findListeningPortsForProfileOwner(profilePath);
+    for (const port of ports) {
+      const cdp = await this.tryGetLocalCdp(port);
+      if (cdp) {
+        this.log(`Recovered existing Bridgewright Edge on local CDP port ${port}`);
+        return { cdp, port };
+      }
+      this.log(`Existing Bridgewright Edge candidate port ${port} was not CDP-ready`);
+    }
+    return undefined;
+  }
+
+  private findListeningPortsForProfileOwner(profilePath: string): Promise<number[]> {
+    if (os.platform() !== 'win32') {
+      return Promise.resolve([]);
+    }
+    const profileLiteral = profilePath.replace(/'/g, "''");
+    const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+$profile = '${profileLiteral}'
+$owners = Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" |
+  Where-Object { $_.CommandLine -like "*$profile*" -and $_.CommandLine -notlike "*--type=*" } |
+  Select-Object -ExpandProperty ProcessId
+$ports = foreach ($owner in $owners) {
+  Get-NetTCPConnection -State Listen -OwningProcess $owner -ErrorAction SilentlyContinue |
+    Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' } |
+    Select-Object -ExpandProperty LocalPort
+}
+@($ports | Sort-Object -Unique) | ConvertTo-Json
+`;
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    return new Promise(resolve => {
+      childProcess.execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', encoded], {
+        timeout: 5_000,
+        windowsHide: true,
+      }, (error, stdout) => {
+        if (error) {
+          this.log(`Could not inspect existing Bridgewright Edge ports: ${this.errorMessage(error)}`);
+          resolve([]);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout.trim() || '[]') as unknown;
+          const values = Array.isArray(parsed) ? parsed : [parsed];
+          resolve(values.filter((value): value is number => Number.isInteger(value) && value > 0 && value <= 65535));
+        } catch (parseError) {
+          this.log(`Could not parse existing Bridgewright Edge ports: ${this.errorMessage(parseError)}`);
+          resolve([]);
+        }
+      });
+    });
+  }
+
+  private async tryReadDevToolsActivePort(profilePath: string): Promise<number | undefined> {
+    try {
+      const [line] = (await fs.promises.readFile(path.join(profilePath, 'DevToolsActivePort'), 'utf8')).split(/\r?\n/);
+      const port = Number.parseInt(line ?? '', 10);
+      return Number.isInteger(port) && port > 0 && port <= 65535 ? port : undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async tryGetLocalCdp(port: number): Promise<CdpVersion | undefined> {
+    try {
+      const body = await this.httpGet(`http://127.0.0.1:${port}/json/version`);
+      const parsed = JSON.parse(body) as CdpVersion;
+      return parsed.webSocketDebuggerUrl ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async waitForDevToolsActivePort(profilePath: string, edgeProcess: childProcess.ChildProcess): Promise<number> {
@@ -1594,7 +1697,7 @@ export class BridgeManager implements vscode.Disposable {
       if (this.runtimes.get(runtime.profile) === runtime) {
         this.runtimes.delete(runtime.profile);
       }
-      if (this.edgeProcess === runtime.process) {
+      if (runtime.process && this.edgeProcess === runtime.process) {
         this.edgeProcess = undefined;
         this.edgeCdp = undefined;
       }
@@ -1715,7 +1818,6 @@ export class BridgeManager implements vscode.Disposable {
 
     const launch = (async () => {
       const profilePath = this.resolveProfilePath(profile);
-      this.assertProfileAvailable(profilePath);
       const launched = await this.launchEdge(this.findEdgePath(), profilePath);
       const runtime: EdgeRuntime = {
         profile,
@@ -1725,7 +1827,7 @@ export class BridgeManager implements vscode.Disposable {
         process: launched.process,
         activeSessions: 0,
       };
-      launched.process.once('exit', () => {
+      launched.process?.once('exit', () => {
         if (this.runtimes.get(profile)?.process === launched.process) {
           this.runtimes.delete(profile);
           if (profile === DEFAULT_PROFILE) {

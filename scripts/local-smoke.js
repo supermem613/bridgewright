@@ -185,6 +185,16 @@ function installVscodeShim(defaultProfilePath, configOverrides = {}) {
   };
 }
 
+function installHomeShim(homePath) {
+  const originalHomedir = os.homedir;
+  os.homedir = () => homePath;
+  return {
+    restore() {
+      os.homedir = originalHomedir;
+    },
+  };
+}
+
 function loadBridgeManager() {
   const managerPath = require.resolve('../dist/manager.js');
   delete require.cache[managerPath];
@@ -288,6 +298,108 @@ async function runLockedDefaultProfileProbe(reporter = console) {
       helper.stop();
     }
     shim.restore();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function runIsolatedDefaultProfileProbe(reporter = console) {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bridgewright-isolated-default-'));
+  const fakeHome = path.join(root, 'home');
+  const systemProfilePath = path.join(fakeHome, 'AppData', 'Local', 'Microsoft', 'Edge', 'User Data');
+  await fs.promises.mkdir(systemProfilePath, { recursive: true });
+  await fs.promises.writeFile(path.join(systemProfilePath, 'SingletonLock'), 'locked', 'utf8');
+  const homeShim = installHomeShim(fakeHome);
+  const shim = installVscodeShim(undefined, {
+    edgeUserDataDir: '',
+    useSystemEdgeUserDataDirByDefault: false,
+    connectorPoolSize: 1,
+  });
+  const helperPorts = await reservePortPair();
+  const expectedProfilePath = path.join(fakeHome, '.bridgewright', 'default-edge-user-data');
+  let helper;
+  let manager;
+
+  try {
+    const BridgeManager = loadBridgeManager();
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 5000 });
+    manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
+    await manager.ensureStorage();
+    manager.openLog();
+    manager.setStatus('running');
+    manager.state = {
+      status: 'running',
+      endpoint: `http://127.0.0.1:${helperPorts.cdpPort}`,
+      remotePort: helperPorts.cdpPort,
+      tunnelPort: helperPorts.tunnelPort,
+      profilePath: manager.profilePath,
+      updatedAt: new Date().toISOString(),
+    };
+    await manager.startConnectorPool(new URL(`http://127.0.0.1:${helperPorts.tunnelPort}/bridgewright-tunnel`));
+
+    await assertDiscoveryEndpoint(helperPorts.cdpPort, '');
+    assert.equal(manager.profilePath, expectedProfilePath);
+    assert.ok(fs.existsSync(path.join(systemProfilePath, 'SingletonLock')), 'System Edge profile lock should remain untouched');
+    reporter.log('Empty default config uses isolated Bridgewright profile when system Edge profile is locked: ok');
+  } finally {
+    if (manager) {
+      await manager.stopProcesses();
+    }
+    if (helper) {
+      helper.stop();
+    }
+    shim.restore();
+    homeShim.restore();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function runSystemDefaultProfileCompatibilityProbe(reporter = console) {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bridgewright-system-default-'));
+  const fakeHome = path.join(root, 'home');
+  const systemProfilePath = path.join(fakeHome, 'AppData', 'Local', 'Microsoft', 'Edge', 'User Data');
+  await fs.promises.mkdir(systemProfilePath, { recursive: true });
+  await fs.promises.writeFile(path.join(systemProfilePath, 'SingletonLock'), 'locked', 'utf8');
+  const homeShim = installHomeShim(fakeHome);
+  const shim = installVscodeShim(undefined, {
+    edgeUserDataDir: '',
+    useSystemEdgeUserDataDirByDefault: true,
+    connectorPoolSize: 1,
+  });
+  const helperPorts = await reservePortPair();
+  let helper;
+  let manager;
+
+  try {
+    const BridgeManager = loadBridgeManager();
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 2000 });
+    manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
+    await manager.ensureStorage();
+    manager.openLog();
+    manager.setStatus('running');
+    manager.state = {
+      status: 'running',
+      endpoint: `http://127.0.0.1:${helperPorts.cdpPort}`,
+      remotePort: helperPorts.cdpPort,
+      tunnelPort: helperPorts.tunnelPort,
+      profilePath: manager.profilePath,
+      updatedAt: new Date().toISOString(),
+    };
+    await manager.startConnectorPool(new URL(`http://127.0.0.1:${helperPorts.tunnelPort}/bridgewright-tunnel`));
+
+    const response = await httpRequest(helperPorts.cdpPort, '/json/version');
+    assert.equal(response.statusCode, 503);
+    assert.equal(manager.profilePath, systemProfilePath);
+    assert.match(JSON.parse(response.body).error, /automation profile appears to be in use/);
+    reporter.log('Compatibility switch uses system Edge profile when explicitly enabled: ok');
+  } finally {
+    if (manager) {
+      await manager.stopProcesses();
+    }
+    if (helper) {
+      helper.stop();
+    }
+    shim.restore();
+    homeShim.restore();
     await fs.promises.rm(root, { recursive: true, force: true });
   }
 }
@@ -853,7 +965,9 @@ async function main() {
 module.exports = {
   parseArgs,
   runLocalSmoke,
+  runIsolatedDefaultProfileProbe,
   runLockedDefaultProfileProbe,
+  runSystemDefaultProfileCompatibilityProbe,
 };
 
 if (require.main === module) {
