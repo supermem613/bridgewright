@@ -55,7 +55,7 @@ export function createRemoteLauncherScript(options: RemoteLauncherOptions): stri
     '    --connector-timeout-ms \\',
     `    ${options.connectorTimeoutMs ?? 3000} \\`,
     '    --discovery-timeout-ms \\',
-    `    ${options.discoveryTimeoutMs ?? 20000}`,
+    `    ${options.discoveryTimeoutMs ?? 60000}`,
     '} >> "$log" 2>&1',
     '',
   ].join('\n');

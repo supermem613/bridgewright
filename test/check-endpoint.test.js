@@ -2,6 +2,8 @@ const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const http = require('node:http');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
@@ -150,6 +152,35 @@ test('check-endpoint rejects invalid timeout arguments', async () => {
   const result = await runChecker(['--timeout-ms', '0']);
   assert.equal(result.status, 2);
   assert.equal(JSON.parse(result.stdout).ok, false);
+});
+
+test('check-endpoint identifies stale ready metadata when endpoint refuses connections', async () => {
+  const port = await reservePort();
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bridgewright-stale-ready-'));
+  const stateFile = path.join(root, 'endpoint.json');
+  await fs.promises.writeFile(stateFile, JSON.stringify({
+    endpoint: `http://127.0.0.1:${port}`,
+    port,
+    protocol: 'cdp',
+    status: 'running',
+    owner: 'bridgewright',
+    updatedAt: '2026-06-11T18:13:47.737Z',
+    cdpReady: true,
+    connectorCount: 4,
+  }, null, 2), 'utf8');
+
+  try {
+    const result = await runChecker(['--endpoint', `http://127.0.0.1:${port}`, '--state-file', stateFile, '--timeout-ms', '250']);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, false);
+    assert.equal(output.checked[0].staleReadyState, true);
+    assert.match(output.checked[0].error, /ECONNREFUSED/);
+    assert.equal(output.checked[0].endpointState.status, 'running');
+    assert.equal(output.checked[0].endpointState.cdpReady, true);
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('check-endpoint diagnose skips Playwright when package is unavailable', async () => {

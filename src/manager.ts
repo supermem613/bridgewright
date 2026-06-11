@@ -678,7 +678,7 @@ async function proxyHttpRequest(request, response) {
   log('cdp http request ' + request.method + ' ' + normalized.facadeUrl);
   let tunnel;
   try {
-    tunnel = await takeTunnel();
+    tunnel = await takeTunnel(isDiscovery ? discoveryTimeoutMs : connectorTimeoutMs);
   } catch (error) {
     log('failed to acquire tunnel for ' + normalized.facadeUrl + ': ' + error.message);
     sendJson(response, 503, { error: 'Bridgewright local connector unavailable', detail: error.message });
@@ -1055,9 +1055,11 @@ export class BridgeManager implements vscode.Disposable {
   private async stopRuntime(runtime: EdgeRuntime): Promise<void> {
     const runtimeProcess = runtime.process;
     if (!runtimeProcess) {
+      await this.closeRuntimeOverCdp(runtime);
       return;
     }
     if (runtimeProcess.exitCode !== null || runtimeProcess.signalCode !== null) {
+      await this.closeRuntimeOverCdp(runtime);
       return;
     }
     if (!runtimeProcess.killed) {
@@ -1067,6 +1069,14 @@ export class BridgeManager implements vscode.Disposable {
       new Promise<void>(resolve => runtimeProcess.once('exit', () => resolve())),
       this.delay(2_000),
     ]);
+  }
+
+  private async closeRuntimeOverCdp(runtime: EdgeRuntime): Promise<void> {
+    try {
+      await this.httpGet(`http://127.0.0.1:${runtime.port}/json/close`);
+    } catch (error) {
+      this.log(`Could not close Edge runtime over CDP on ${runtime.port}: ${this.errorMessage(error)}`);
+    }
   }
 
   private async stopAndDeleteNamedProfile(profile: string): Promise<void> {
@@ -1362,7 +1372,6 @@ export class BridgeManager implements vscode.Disposable {
       `--user-data-dir=${profilePath}`,
       '--no-first-run',
       '--no-default-browser-check',
-      'about:blank',
     ];
 
     this.log(`Launching Edge: ${edgePath} ${args.join(' ')}`);
@@ -1464,7 +1473,8 @@ $ports = foreach ($owner in $owners) {
     let lastError: string | undefined;
 
     while (Date.now() < deadline) {
-      if (edgeProcess.exitCode !== null || edgeProcess.signalCode !== null) {
+      const cleanHandoffExit = edgeProcess.exitCode === 0 && edgeProcess.signalCode === null;
+      if ((edgeProcess.exitCode !== null || edgeProcess.signalCode !== null) && !cleanHandoffExit) {
         throw new Error(`Edge exited before writing DevToolsActivePort. code=${edgeProcess.exitCode ?? 'null'} signal=${edgeProcess.signalCode ?? 'null'}`);
       }
       try {
@@ -1477,6 +1487,9 @@ $ports = foreach ($owner in $owners) {
         lastError = `DevToolsActivePort did not contain a valid port: ${line ?? ''}`;
       } catch (error) {
         lastError = this.errorMessage(error);
+      }
+      if (cleanHandoffExit) {
+        lastError = `Edge launcher exited cleanly before DevToolsActivePort was visible. ${lastError ?? ''}`.trim();
       }
       await this.delay(250);
     }
@@ -1529,7 +1542,7 @@ $ports = foreach ($owner in $owners) {
       cdpPort: port,
       tunnelPort,
       connectorTimeoutMs: 3000,
-      discoveryTimeoutMs: 20000,
+      discoveryTimeoutMs: 60000,
     }), 'utf8'));
 
     this.helperTerminal?.dispose();

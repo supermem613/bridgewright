@@ -266,7 +266,7 @@ async function runLockedDefaultProfileProbe(reporter = console) {
 
   try {
     const BridgeManager = loadBridgeManager();
-    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 2000 });
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort);
     manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
     manager.rootPath = path.join(root, 'bridgewright-state');
     manager.logsPath = path.join(manager.rootPath, 'logs');
@@ -321,7 +321,7 @@ async function runIsolatedDefaultProfileProbe(reporter = console) {
 
   try {
     const BridgeManager = loadBridgeManager();
-    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 5000 });
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort);
     manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
     await manager.ensureStorage();
     manager.openLog();
@@ -371,7 +371,7 @@ async function runSystemDefaultProfileCompatibilityProbe(reporter = console) {
 
   try {
     const BridgeManager = loadBridgeManager();
-    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort, { discoveryTimeoutMs: 2000 });
+    helper = await startHelper(root, helperPorts.cdpPort, helperPorts.tunnelPort);
     manager = new BridgeManager({ extensionUri: { path: process.cwd(), toString: () => process.cwd() }, subscriptions: [] });
     await manager.ensureStorage();
     manager.openLog();
@@ -458,6 +458,11 @@ async function assertDiscoveryEndpoint(port, routePrefix) {
 
   const targets = await httpJson(port, `${routePrefix}/json/list`);
   assert.ok(Array.isArray(targets), `${routePrefix || 'root'} /json/list should return a target array`);
+  assert.equal(
+    targets.filter(target => target.type === 'page' && target.url === 'about:blank').length,
+    0,
+    `${routePrefix || 'root'} discovery should not expose initial about:blank page targets`,
+  );
   for (const target of targets) {
     if (target.webSocketDebuggerUrl) {
       assert.equal(new URL(target.webSocketDebuggerUrl).port, String(port));

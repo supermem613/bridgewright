@@ -14,7 +14,7 @@ const STATE_FILE = path.join(os.homedir(), '.bridgewright', 'endpoint.json');
 
 const USAGE = `
 Usage:
-  node .claude/skills/bridgewright/scripts/check-endpoint.js [--endpoint <url>] [--timeout-ms <ms>] [--playwright] [--diagnose]
+  node .claude/skills/bridgewright/scripts/check-endpoint.js [--endpoint <url>] [--state-file <path>] [--timeout-ms <ms>] [--playwright] [--diagnose]
 
 Checks /json/version, /json/version/, and /json/list for the Bridgewright CDP endpoint.
 Use --playwright to also verify chromium.connectOverCDP.
@@ -32,6 +32,7 @@ Exit codes:
 function parseArgs(argv) {
   const result = {
     endpoint: undefined,
+    stateFile: STATE_FILE,
     timeoutMs: 2000,
     playwright: false,
     diagnose: false
@@ -47,6 +48,13 @@ function parseArgs(argv) {
       result.endpoint = argv[++i];
       if (!result.endpoint) {
         failArgs('Missing value for --endpoint');
+      }
+      continue;
+    }
+    if (arg === '--state-file') {
+      result.stateFile = argv[++i];
+      if (!result.stateFile) {
+        failArgs('Missing value for --state-file');
       }
       continue;
     }
@@ -82,17 +90,14 @@ function failArgs(message) {
   process.exit(2);
 }
 
-function readEndpointFile() {
+function readEndpointState(stateFile) {
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const raw = fs.readFileSync(stateFile, 'utf8');
     const parsed = JSON.parse(raw);
-    if (typeof parsed.endpoint === 'string' && parsed.endpoint.length > 0) {
-      return parsed.endpoint;
-    }
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
   } catch {
     return undefined;
   }
-  return undefined;
 }
 
 function getJson(url, timeoutMs) {
@@ -244,12 +249,13 @@ async function checkPlaywright(endpoint, timeoutMs, includeDiagnostics, requireP
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const candidates = [];
+  const endpointState = readEndpointState(args.stateFile);
 
   if (args.endpoint) {
     candidates.push({ endpoint: args.endpoint, source: 'argument' });
   } else {
     candidates.push({ endpoint: DEFAULT_ENDPOINT, source: 'default-port' });
-    const fromFile = readEndpointFile();
+    const fromFile = typeof endpointState?.endpoint === 'string' && endpointState.endpoint.length > 0 ? endpointState.endpoint : undefined;
     if (fromFile && fromFile !== DEFAULT_ENDPOINT) {
       candidates.push({ endpoint: fromFile, source: 'endpoint-file' });
     }
@@ -262,11 +268,21 @@ async function main() {
       process.stdout.write(JSON.stringify(result) + '\n');
       return;
     } catch (error) {
+      const health = await tryReadHealth(candidate.endpoint, args.timeoutMs);
+      const candidateState = endpointState?.endpoint === candidate.endpoint ? endpointState : undefined;
+      const staleReadyState = Boolean(
+        candidateState
+        && candidateState.status === 'running'
+        && candidateState.cdpReady === true
+        && /ECONNREFUSED/.test(`${error.message} ${health.error || ''}`)
+      );
       failures.push({
         endpoint: candidate.endpoint,
         source: candidate.source,
         error: error.message,
-        health: await tryReadHealth(candidate.endpoint, args.timeoutMs)
+        health,
+        endpointState: candidateState,
+        staleReadyState
       });
     }
   }
@@ -274,7 +290,7 @@ async function main() {
   process.stdout.write(JSON.stringify({
     ok: false,
     checked: failures,
-    stateFile: STATE_FILE,
+    stateFile: args.stateFile,
     hint: 'Start the Bridgewright bridge from the VS Code status bar, then rerun this check.'
   }) + '\n');
   process.exit(1);

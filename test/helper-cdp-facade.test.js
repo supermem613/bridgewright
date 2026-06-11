@@ -512,6 +512,32 @@ test('discovery with silent connector returns timeout 503 JSON', async () => {
   }, { discoveryTimeoutMs: 100 });
 });
 
+test('first discovery waits for a late connector before returning 503', async () => {
+  await withHelper(async helper => {
+    const pending = httpGet(helper.cdpPort, '/json/version');
+    let settled = false;
+    pending.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await delay(250);
+    assert.equal(settled, false, 'discovery failed before a late connector could attach');
+    const tunnel = await connectTunnel(helper.tunnelPort);
+    const request = (await tunnel.nextFrame()).toString('utf8');
+    assert.match(request, /^GET \/json\/version HTTP\/1\.1/m);
+    const body = JSON.stringify({
+      Browser: 'BridgewrightTest/late',
+      webSocketDebuggerUrl: `ws://127.0.0.1:${helper.cdpPort}/devtools/browser/late`,
+    });
+    tunnel.send(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    tunnel.close();
+
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    assert.equal(JSON.parse(response.body).Browser, 'BridgewrightTest/late');
+  }, { connectorTimeoutMs: 100, discoveryTimeoutMs: 1000 });
+});
+
 test('malformed upstream discovery response returns 502 JSON', async () => {
   await withHelper(async helper => {
     const tunnel = await connectTunnel(helper.tunnelPort);
